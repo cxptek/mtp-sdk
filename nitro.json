@@ -1,0 +1,17 @@
+{
+  "cxxNamespace": ["cxpmobile_tpsdk"],
+  "ios": {
+    "iosModuleName": "TpSdk"
+  },
+  "android": {
+    "androidNamespace": ["cxpmobile","tpsdk"],
+    "androidCxxLibName": "cxpmobile_tpsdk"
+  },
+  "autolinking": {
+    "TpSdk": {
+      "swift": "TpSdk",
+      "kotlin": "TpSdk"
+    }
+  },
+  "ignorePaths": ["node_modules"]
+}
