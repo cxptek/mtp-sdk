@@ -11,13 +11,18 @@ Pod::Spec.new do |s|
   s.authors      = package["author"]
 
   s.platforms    = { :ios => min_ios_version_supported }
-  s.source       = { :git => "https://github.com/asiaeric/cxp-mobile-tp-sdk.git", :tag => "#{s.version}" }
+  s.source       = { :git => "https://github.com/cxptek/mtp-sdk.git", :tag => "#{s.version}" }
 
   s.source_files = [
-    "ios/**/*.{swift}",
     "ios/**/*.{m,mm}",
+    "ios/**/*.{h}",
     "cpp/**/*.{hpp,cpp}",
   ]
+
+  s.pod_target_xcconfig = {
+    "HEADER_SEARCH_PATHS" => "$(PODS_TARGET_SRCROOT)/.. $(PODS_TARGET_SRCROOT)/../nitrogen/generated/shared/c++ $(PODS_TARGET_SRCROOT)/../cpp",
+    "CLANG_CXX_LANGUAGE_STANDARD" => "c++20"
+  }
 
   s.dependency 'React-jsi'
   s.dependency 'React-callinvoker'

@@ -9,8 +9,7 @@
   },
   "autolinking": {
     "TpSdk": {
-      "swift": "TpSdk",
-      "kotlin": "TpSdk"
+      "cpp": "TpSdkCppHybrid"
     }
   },
   "ignorePaths": ["node_modules"]

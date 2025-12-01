@@ -24,7 +24,9 @@ apply plugin: "com.android.library"
 apply plugin: "kotlin-android"
 apply from: '../nitrogen/generated/android/cxpmobile_tpsdk+autolinking.gradle'
 
-apply plugin: "com.facebook.react"
+// Don't apply React plugin to avoid autolinking other React Native modules
+// Root SDK is a library module and should not autolink modules from example's node_modules
+// apply plugin: "com.facebook.react"
 
 def getExtOrIntegerDefault(name) {
   return rootProject.ext.has(name) ? rootProject.ext.get(name) : (project.properties["TpSdk_" + name]).toInteger()
@@ -120,6 +122,15 @@ repositories {
 }
 
 def kotlin_version = getExtOrDefault("kotlinVersion")
+
+// Exclude react-native-gesture-handler from all configurations to avoid duplicate classes
+// It should only be included in the example app, not in the root SDK library
+configurations.all {
+  exclude group: 'com.swmansion.gesturehandler', module: 'react-native-gesture-handler'
+  exclude group: 'com.facebook.react', module: 'react-native-gesture-handler'
+  // Exclude by project name if autolinked
+  exclude group: '', module: 'react-native-gesture-handler'
+}
 
 dependencies {
   implementation "com.facebook.react:react-android"
