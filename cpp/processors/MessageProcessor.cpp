@@ -43,7 +43,6 @@ namespace margelo::nitro::cxpmobile_tpsdk
                 const auto &orderBookData = *messageResult.orderBookData;
                 const auto &bids = orderBookData.bids;
                 const auto &asks = orderBookData.asks;
-                std::cerr << "[C++ DEBUG] processOrderbookMessage: processing orderbook, bids=" << bids.size() << ", asks=" << asks.size() << std::endl;
 
                 TpSdkCppHybrid::OrderBookState *state = &instance->orderBookState_;
 
@@ -88,20 +87,24 @@ namespace margelo::nitro::cxpmobile_tpsdk
                     }
 
                     // Check if formatted cache is valid (while holding lock)
+                    // Early check: if cache is valid, we can use it immediately
                     if (!state->formattedCacheDirty &&
                         state->cachedBaseDecimals == state->baseDecimals &&
                         state->cachedPriceDisplayDecimals == state->priceDisplayDecimals &&
-                        state->cachedMaxRows == state->maxRows)
+                        state->cachedMaxRows == state->maxRows &&
+                        !state->bidsCacheDirty &&
+                        !state->asksCacheDirty)
                     {
                         useCachedResult = true;
                         cachedResult = state->cachedFormattedResult;
                     }
                 }
 
-                // Use cached result if available
+                // Use cached result if available - early return to avoid processing
                 if (useCachedResult)
                 {
                     TpSdkCppHybrid::queueOrderBookCallback(cachedResult, instance);
+                    return; // Early return to avoid unnecessary processing
                 }
                 else
                 {
@@ -129,28 +132,32 @@ namespace margelo::nitro::cxpmobile_tpsdk
                             priceDisplayDecimals,
                             maxRows);
 
-                        // Update formatted cache (minimal lock time)
+                        // Update formatted cache (minimal lock time) - use move to avoid copy
                         {
                             std::lock_guard<std::mutex> lock(state->mutex);
-                            state->cachedFormattedResult = viewResult;
+                            state->cachedFormattedResult = std::move(viewResult);
                             state->cachedBaseDecimals = baseDecimals;
                             state->cachedPriceDisplayDecimals = priceDisplayDecimals;
                             state->cachedMaxRows = maxRows;
                             state->formattedCacheDirty = false;
+                            
+                            // Queue callback while holding lock to access cached result safely
+                            TpSdkCppHybrid::queueOrderBookCallback(state->cachedFormattedResult, instance);
                         }
-
-                        TpSdkCppHybrid::queueOrderBookCallback(viewResult, instance);
                     }
                     else
                     {
+                        // Optimize: get vectors with single lock, format outside lock
                         std::vector<OrderBookLevel> bidsVec;
                         std::vector<OrderBookLevel> asksVec;
                         {
                             std::lock_guard<std::mutex> lock(state->mutex);
+                            // getBidsVector/getAsksVector use internal cache, so this is efficient
                             bidsVec = state->getBidsVector();
                             asksVec = state->getAsksVector();
                         }
 
+                        // Format outside lock to minimize lock contention
                         OrderBookViewResult viewResult = instance->formatOrderBookView(
                             bidsVec,
                             asksVec,
@@ -159,16 +166,18 @@ namespace margelo::nitro::cxpmobile_tpsdk
                             priceDisplayDecimals,
                             maxRows);
 
+                        // Update cache and queue callback with minimal lock time
                         {
                             std::lock_guard<std::mutex> lock(state->mutex);
-                            state->cachedFormattedResult = viewResult;
+                            state->cachedFormattedResult = std::move(viewResult);
                             state->cachedBaseDecimals = baseDecimals;
                             state->cachedPriceDisplayDecimals = priceDisplayDecimals;
                             state->cachedMaxRows = maxRows;
                             state->formattedCacheDirty = false;
+                            
+                            // Queue callback while holding lock to access cached result safely
+                            TpSdkCppHybrid::queueOrderBookCallback(state->cachedFormattedResult, instance);
                         }
-
-                        TpSdkCppHybrid::queueOrderBookCallback(viewResult, instance);
                     }
                 }
             }
@@ -287,6 +296,7 @@ namespace margelo::nitro::cxpmobile_tpsdk
                     {
                         {
                             std::lock_guard<std::mutex> lock(instance->allTickersMutex_);
+                            size_t initialSize = instance->allTickersData_.size();
                             for (const auto &tickerData : allTickers)
                             {
                                 auto it = std::find_if(instance->allTickersData_.begin(), instance->allTickersData_.end(),
@@ -302,6 +312,11 @@ namespace margelo::nitro::cxpmobile_tpsdk
                                 {
                                     instance->allTickersData_.push_back(tickerData);
                                 }
+                            }
+                            // Shrink if capacity is much larger than size (e.g., > 2x) to free memory
+                            if (instance->allTickersData_.capacity() > instance->allTickersData_.size() * 2 && instance->allTickersData_.size() > 0)
+                            {
+                                instance->allTickersData_.shrink_to_fit();
                             }
                         }
 
@@ -342,7 +357,15 @@ namespace margelo::nitro::cxpmobile_tpsdk
                 if (!interval.empty())
                 {
                     std::lock_guard<std::mutex> lock(instance->klineState_.mutex);
+                    size_t initialSize = instance->klineState_.data.size();
                     instance->klineState_.data.emplace(interval, klineData);
+                    
+                    // Optimize memory if map has grown significantly (rehash periodically)
+                    // Rehash every 10 insertions to keep memory usage reasonable
+                    if (instance->klineState_.data.size() % 10 == 0 && instance->klineState_.data.size() > initialSize)
+                    {
+                        instance->klineState_.optimizeMemory();
+                    }
                 }
 
                 TpSdkCppHybrid::queueKlineCallback(klineData, instance);
@@ -382,9 +405,16 @@ namespace margelo::nitro::cxpmobile_tpsdk
                     std::lock_guard<std::mutex> lock(instance->tradesState_.mutex);
                     instance->tradesState_.queue.push_back(tradeDataForCallback);
 
+                    size_t initialSize = instance->tradesState_.queue.size();
                     while (instance->tradesState_.queue.size() > static_cast<size_t>(instance->tradesState_.maxRows))
                     {
                         instance->tradesState_.queue.pop_front();
+                    }
+                    
+                    // Optimize memory if we've trimmed significantly (reduced by more than 50%)
+                    if (initialSize > static_cast<size_t>(instance->tradesState_.maxRows) * 2)
+                    {
+                        instance->tradesState_.optimizeMemory();
                     }
                 }
 

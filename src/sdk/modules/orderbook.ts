@@ -6,12 +6,12 @@
  */
 
 import type { OrderBookViewResult } from '../../TpSdk.nitro';
+import { SubscriptionManager } from '../../shared/SubscriptionManager';
 import { TpSdkHybridObject } from '../../shared/TpSdkInstance';
 import {
   processCallbacksThrottled,
   processFakeMessage,
 } from '../../shared/callbackQueue';
-import { SubscriptionManager } from '../../shared/SubscriptionManager';
 import { createModuleValidator } from '../../shared/moduleUtils';
 
 const validateInitialized = createModuleValidator('orderbook');

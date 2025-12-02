@@ -478,7 +478,6 @@ namespace margelo::nitro::cxpmobile_tpsdk
     {
         if (instance == nullptr)
         {
-            std::cerr << "[C++ DEBUG] queueOrderBookCallback: instance is null" << std::endl;
             return;
         }
 
@@ -487,22 +486,152 @@ namespace margelo::nitro::cxpmobile_tpsdk
             std::lock_guard<std::mutex> callbackLock(instance->orderBookCallbackMutex_);
             if (!instance->orderBookCallback_)
             {
-                std::cerr << "[C++ DEBUG] queueOrderBookCallback: no callback registered" << std::endl;
                 return;
             }
             callback = instance->orderBookCallback_;
         }
 
-        std::cerr << "[C++ DEBUG] queueOrderBookCallback: queuing callback, bids=" << viewResult.bids.size() << ", asks=" << viewResult.asks.size() << std::endl;
+        // Throttle: only queue if THROTTLE_INTERVAL has passed since last queue
+        auto now = std::chrono::steady_clock::now();
+        bool shouldQueue = true;
 
-        manageCallbackQueueSize(2);
+        {
+            std::lock_guard<std::mutex> throttleLock(instance->orderBookCallbackState_.mutex);
+            auto &callbackState = instance->orderBookCallbackState_;
+
+            // First time: always queue (no last result to compare)
+            if (!callbackState.hasLastResult)
+            {
+                callbackState.lastCallbackTime = now;
+                callbackState.lastQueuedResult = viewResult; // Copy for comparison (not move yet)
+                callbackState.hasLastResult = true;
+                shouldQueue = true;
+            }
+            else
+            {
+                auto timeSinceLastCall = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - callbackState.lastCallbackTime);
+
+                // If not enough THROTTLE_INTERVAL, skip this callback (drop silently)
+                // But ensure at least 1 update every 200ms to prevent UI from being stale
+                if (timeSinceLastCall < TpSdkCppHybrid::ORDERBOOK_THROTTLE_INTERVAL)
+                {
+                    auto maxStaleTime = std::chrono::milliseconds(200);
+                    if (timeSinceLastCall >= maxStaleTime)
+                    {
+                        // Force queue after 200ms to ensure UI doesn't become stale
+                        callbackState.lastCallbackTime = now;
+                        callbackState.lastQueuedResult = viewResult;
+                        shouldQueue = true;
+                    }
+                    else
+                    {
+                        return; // Drop update, keep last result
+                    }
+                }
+                else
+                {
+                    // Enough throttle interval, continue with conditional check
+
+                    // Conditional update: only queue if there are significant changes
+                    // Simplified: only check top price and item count (most important for UI)
+                    const auto &last = callbackState.lastQueuedResult;
+
+                    // Compare item count (important - if changed, must update)
+                    bool itemsCountChanged =
+                        (last.bids.size() != viewResult.bids.size()) ||
+                        (last.asks.size() != viewResult.asks.size());
+
+                    // Compare top price changes (most important for UI)
+                    bool topPriceChanged = false;
+                    if (!last.bids.empty() && !viewResult.bids.empty())
+                    {
+                        const auto &lastTopBid = last.bids[0];
+                        const auto &newTopBid = viewResult.bids[0];
+                        if (lastTopBid.priceStr.has_value() && newTopBid.priceStr.has_value())
+                        {
+                            topPriceChanged = lastTopBid.priceStr.value() != newTopBid.priceStr.value();
+                        }
+                    }
+                    if (!topPriceChanged && !last.asks.empty() && !viewResult.asks.empty())
+                    {
+                        const auto &lastTopAsk = last.asks[0];
+                        const auto &newTopAsk = viewResult.asks[0];
+                        if (lastTopAsk.priceStr.has_value() && newTopAsk.priceStr.has_value())
+                        {
+                            topPriceChanged = lastTopAsk.priceStr.value() != newTopAsk.priceStr.value();
+                        }
+                    }
+
+                    // Compare maxCumulativeQuantityNum (only check if no price/item changes)
+                    bool maxCumulativeChanged = false;
+                    if (!itemsCountChanged && !topPriceChanged)
+                    {
+                        if (last.maxCumulativeQuantityNum.has_value() &&
+                            viewResult.maxCumulativeQuantityNum.has_value())
+                        {
+                            double diff = std::abs(
+                                last.maxCumulativeQuantityNum.value() -
+                                viewResult.maxCumulativeQuantityNum.value());
+                            // Threshold 0.1% - only check if no price/item changes
+                            maxCumulativeChanged = diff > (last.maxCumulativeQuantityNum.value() * 0.001);
+                        }
+                        else
+                        {
+                            maxCumulativeChanged = last.maxCumulativeQuantityNum != viewResult.maxCumulativeQuantityNum;
+                        }
+                    }
+
+                    // Queue if there are any changes
+                    shouldQueue = maxCumulativeChanged || itemsCountChanged || topPriceChanged;
+
+                    // Update throttle state if will queue
+                    if (shouldQueue)
+                    {
+                        callbackState.lastCallbackTime = now;
+                        // Copy (not move) to keep for next comparison
+                        callbackState.lastQueuedResult = viewResult;
+                    }
+                    else
+                    {
+                        // Don't update lastQueuedResult if not queueing (keep for comparison)
+                        return; // Drop update
+                    }
+                }
+            }
+        }
+
+        // Only queue if shouldQueue is true (determined by throttle/conditional logic above)
+        if (!shouldQueue)
+        {
+            return; // Should not reach here, but safety check
+        }
+
+        // Aggressive: only keep latest orderbook callback in queue
+        // Drop all old orderbook callbacks, only keep latest
         {
             std::lock_guard<std::mutex> queueLock(callbackQueueMutex_);
+
+            // Drop old orderbook callbacks in queue
+            // Note: We can't easily identify orderbook callbacks without adding type field
+            // For now, use aggressive dropping: if queue is getting full, drop older ones
+            if (callbackQueue_.size() >= MAX_CALLBACK_QUEUE_SIZE)
+            {
+                // Drop half of queue to make room
+                size_t dropCount = MAX_CALLBACK_QUEUE_SIZE / 2;
+                for (size_t i = 0; i < dropCount && !callbackQueue_.empty(); ++i)
+                {
+                    callbackQueue_.pop();
+                }
+            }
+
+            // Queue latest callback - use move to avoid copying large OrderBookViewResult
+            // Lambda captures viewResult by move to transfer ownership efficiently
+            // Note: viewResult is still valid here (not moved yet) because we copied it to lastQueuedResult
             callbackQueue_.push(CallbackTask{[viewResult = std::move(viewResult), callback]()
                                              {
                                                  try
                                                  {
-                                                     std::cerr << "[C++ DEBUG] Executing OrderBook callback, bids=" << viewResult.bids.size() << ", asks=" << viewResult.asks.size() << std::endl;
                                                      callback(viewResult);
                                                  }
                                                  catch (const std::exception &e)
@@ -526,7 +655,8 @@ namespace margelo::nitro::cxpmobile_tpsdk
             callback = instance->miniTickerCallback_;
         }
 
-        manageCallbackQueueSize(4);
+        // More aggressive queue management for ticker (9 strings per message)
+        manageCallbackQueueSize(2);
         {
             std::lock_guard<std::mutex> queueLock(callbackQueueMutex_);
             callbackQueue_.push(CallbackTask{[tickerData = std::move(tickerData), callback]()
@@ -560,7 +690,9 @@ namespace margelo::nitro::cxpmobile_tpsdk
             callback = instance->miniTickerPairCallback_;
         }
 
-        manageCallbackQueueSize(4);
+        // Most aggressive queue management for ticker pair (vector of tickers, can be very large)
+        // Each TickerMessageData has 9 strings, so a vector of 100 tickers = 900 strings
+        manageCallbackQueueSize(1);
         {
             std::lock_guard<std::mutex> queueLock(callbackQueueMutex_);
             callbackQueue_.push(CallbackTask{[tickerData = std::move(tickerData), callback]()
@@ -590,7 +722,8 @@ namespace margelo::nitro::cxpmobile_tpsdk
             callback = instance->klineCallback_;
         }
 
-        manageCallbackQueueSize(4);
+        // More aggressive queue management for kline (7 strings + 6 optional strings per message)
+        manageCallbackQueueSize(2);
         {
             std::lock_guard<std::mutex> queueLock(callbackQueueMutex_);
             callbackQueue_.push(CallbackTask{[klineData = std::move(klineData), callback]()
@@ -639,8 +772,8 @@ namespace margelo::nitro::cxpmobile_tpsdk
 
     void TpSdkCppHybrid::processCallbackQueue()
     {
-        constexpr size_t MAX_CALLBACKS_PER_BATCH = 5;
-        constexpr size_t DROP_THRESHOLD = 15;
+        constexpr size_t MAX_CALLBACKS_PER_BATCH = 2; // Reduced from 5 to 2
+        constexpr size_t DROP_THRESHOLD = 5;          // Reduced from 15 to 5
 
         std::vector<TpSdkCppHybrid::CallbackTask> callbacksToExecute;
         size_t queueSize = 0;
@@ -648,14 +781,17 @@ namespace margelo::nitro::cxpmobile_tpsdk
         {
             std::lock_guard<std::mutex> lock(callbackQueueMutex_);
             queueSize = callbackQueue_.size();
-            if (queueSize > 0)
-            {
-                std::cerr << "[C++ DEBUG] processCallbackQueue: queue size=" << queueSize << std::endl;
-            }
 
+            // More aggressive dropping for orderbook callbacks to prevent memory buildup
+            // OrderBookViewResult is large (100 items × 3 strings = 300 strings per result)
             if (queueSize > DROP_THRESHOLD)
             {
                 size_t dropCount = queueSize - DROP_THRESHOLD;
+                // Drop more aggressively if queue is very large
+                if (queueSize > DROP_THRESHOLD * 2)
+                {
+                    dropCount = queueSize - (DROP_THRESHOLD / 2);
+                }
                 for (size_t i = 0; i < dropCount && !callbackQueue_.empty(); ++i)
                 {
                     callbackQueue_.pop();

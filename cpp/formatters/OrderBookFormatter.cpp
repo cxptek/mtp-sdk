@@ -135,130 +135,189 @@ OrderBookViewResult formatOrderBookViewFromAggregatedMaps(
     // Asks need ascending order (lowest price first), so iterate forward
     // This eliminates O(m log m) sort operation
     
-    // Calculate sizes (limit to maxRows)
-    size_t aggregatedBidsSize = std::min(aggregatedBids.size(), static_cast<size_t>(maxRows));
-    size_t aggregatedAsksSize = std::min(aggregatedAsks.size(), static_cast<size_t>(maxRows));
+    // IMPORTANT: Slice top maxRows FIRST, then calculate cumulative quantities from sliced levels only
+    // This ensures cumulative quantity reflects only the displayed levels, not all depth
     
-    // Create vectors with exact size needed (no sorting needed, map is already sorted)
-    std::vector<std::pair<double, double>> aggregatedBidsVec;
-    aggregatedBidsVec.reserve(aggregatedBidsSize);
-    // Iterate map in reverse for descending order (bids: highest price first)
+    thread_local static std::vector<std::pair<double, double>> aggregatedBidsVec_;
+    thread_local static std::vector<std::pair<double, double>> aggregatedAsksVec_;
+    thread_local static std::vector<double> bidsCumulativeQuantities_;
+    thread_local static std::vector<double> asksCumulativeQuantities_;
+    thread_local static std::vector<OrderBookViewItem> bidsItems_;
+    thread_local static std::vector<OrderBookViewItem> asksItems_;
+    
+    // Clear and shrink vectors to release memory
+    aggregatedBidsVec_.clear();
+    aggregatedAsksVec_.clear();
+    bidsCumulativeQuantities_.clear();
+    asksCumulativeQuantities_.clear();
+    bidsItems_.clear();
+    asksItems_.clear();
+    
+    // Shrink to fit to release excess capacity and prevent memory growth
+    aggregatedBidsVec_.shrink_to_fit();
+    aggregatedAsksVec_.shrink_to_fit();
+    bidsCumulativeQuantities_.shrink_to_fit();
+    asksCumulativeQuantities_.shrink_to_fit();
+    bidsItems_.shrink_to_fit();
+    asksItems_.shrink_to_fit();
+    
+    // Step 1: Slice top maxRows from aggregated bids (reverse order - highest price first)
+    size_t aggregatedBidsSize = std::min(aggregatedBids.size(), static_cast<size_t>(maxRows));
+    aggregatedBidsVec_.reserve(aggregatedBidsSize);
+    
     auto bidsIt = aggregatedBids.rbegin();
     for (size_t i = 0; i < aggregatedBidsSize && bidsIt != aggregatedBids.rend(); ++i, ++bidsIt)
     {
-        aggregatedBidsVec.emplace_back(bidsIt->first, bidsIt->second);
+        aggregatedBidsVec_.emplace_back(bidsIt->first, bidsIt->second);
     }
     
-    std::vector<std::pair<double, double>> aggregatedAsksVec;
-    aggregatedAsksVec.reserve(aggregatedAsksSize);
-    // Iterate map forward for ascending order (asks: lowest price first)
+    // Step 2: Slice top maxRows from aggregated asks (forward order - lowest price first)
+    size_t aggregatedAsksSize = std::min(aggregatedAsks.size(), static_cast<size_t>(maxRows));
+    aggregatedAsksVec_.reserve(aggregatedAsksSize);
+    
     auto asksIt = aggregatedAsks.begin();
     for (size_t i = 0; i < aggregatedAsksSize && asksIt != aggregatedAsks.end(); ++i, ++asksIt)
     {
-        aggregatedAsksVec.emplace_back(asksIt->first, asksIt->second);
+        aggregatedAsksVec_.emplace_back(asksIt->first, asksIt->second);
     }
+    
+    // Step 3: Calculate cumulative quantities from SLICED bids only
     double maxCumulative = 0.0;
     double cumulativeBids = 0.0;
-    // Pre-allocate cumulative quantities vector to exact size needed
-    std::vector<double> bidsCumulativeQuantities;
-    bidsCumulativeQuantities.reserve(aggregatedBidsSize);
+    bidsCumulativeQuantities_.reserve(aggregatedBidsSize);
     
     for (size_t i = 0; i < aggregatedBidsSize; i++)
     {
-        double quantity = aggregatedBidsVec[i].second;
+        double quantity = aggregatedBidsVec_[i].second;
         cumulativeBids += quantity;
         if (std::isinf(cumulativeBids) || cumulativeBids < 0)
             cumulativeBids = 0.0;
-        bidsCumulativeQuantities.push_back(cumulativeBids);
+        bidsCumulativeQuantities_.push_back(cumulativeBids);
         maxCumulative = std::max(maxCumulative, cumulativeBids);
     }
     
-    std::vector<OrderBookViewItem> bidsItems;
-    bidsItems.reserve(maxRows);
-    
-    for (size_t i = 0; i < aggregatedBidsSize && i < bidsCumulativeQuantities.size(); i++)
-    {
-        double roundedPrice = aggregatedBidsVec[i].first;
-        double cumulativeQty = bidsCumulativeQuantities[i];
-        if (std::isnan(cumulativeQty) || std::isinf(cumulativeQty))
-            cumulativeQty = 0.0;
-        
-        std::string priceStr = ::margelo::nitro::cxpmobile_tpsdk::formatNumberWithDecimalsAndCommas(
-                                                                                                    roundedPrice, priceDisplayDecimals);
-        std::string amountStr = ::margelo::nitro::cxpmobile_tpsdk::formatNumberWithDecimalsAndCommas(
-                                                                                                     cumulativeQty, baseDecimals);
-        std::string cumulativeQtyStr = ::margelo::nitro::cxpmobile_tpsdk::formatNumberWithDecimalsOnly(
-                                                                                                       cumulativeQty, baseDecimals);
-        
-        bidsItems.emplace_back(
-                               std::make_optional<std::variant<nitro::NullType, std::string>>(std::move(priceStr)),
-                               std::make_optional<std::variant<nitro::NullType, std::string>>(std::move(amountStr)),
-                               std::make_optional<std::variant<nitro::NullType, std::string>>(std::move(cumulativeQtyStr)));
-    }
-    
-    while (bidsItems.size() < static_cast<size_t>(maxRows))
-    {
-        bidsItems.emplace_back(
-                               std::make_optional<std::variant<nitro::NullType, std::string>>(nitro::NullType()),
-                               std::make_optional<std::variant<nitro::NullType, std::string>>(nitro::NullType()),
-                               std::make_optional<std::variant<nitro::NullType, std::string>>(nitro::NullType()));
-    }
-    
+    // Step 4: Calculate cumulative quantities from SLICED asks only
     double cumulativeAsks = 0.0;
-    std::vector<double> asksCumulativeQuantities;
-    asksCumulativeQuantities.reserve(aggregatedAsksSize);
+    asksCumulativeQuantities_.reserve(aggregatedAsksSize);
     
     for (size_t i = 0; i < aggregatedAsksSize; i++)
     {
-        double quantity = aggregatedAsksVec[i].second;
+        double quantity = aggregatedAsksVec_[i].second;
         cumulativeAsks += quantity;
         if (std::isinf(cumulativeAsks) || cumulativeAsks < 0)
             cumulativeAsks = 0.0;
-        asksCumulativeQuantities.push_back(cumulativeAsks);
+        asksCumulativeQuantities_.push_back(cumulativeAsks);
         maxCumulative = std::max(maxCumulative, cumulativeAsks);
     }
     
-    std::vector<OrderBookViewItem> asksItems;
-    asksItems.reserve(maxRows);
-    
-    for (size_t i = 0; i < aggregatedAsksSize && i < asksCumulativeQuantities.size(); i++)
+    // Calculate maxCumulativeInv for animation optimization (pre-calculated 1/maxCumulative)
+    double maxCumulativeInv = 0.0;
+    if (maxCumulative > 0.0 && !std::isnan(maxCumulative) && !std::isinf(maxCumulative))
     {
-        double roundedPrice = aggregatedAsksVec[i].first;
-        double cumulativeQty = asksCumulativeQuantities[i];
-        if (std::isnan(cumulativeQty) || std::isinf(cumulativeQty))
+        maxCumulativeInv = 1.0 / maxCumulative;
+    }
+    
+    // Step 5: Create display items from sliced top maxRows with cumulative quantities (bids)
+    bidsItems_.reserve(maxRows);
+    
+    for (size_t i = 0; i < aggregatedBidsSize && i < bidsCumulativeQuantities_.size(); i++)
+    {
+        double roundedPrice = aggregatedBidsVec_[i].first;
+        double levelQty = aggregatedBidsVec_[i].second; // Level quantity (not cumulative)
+        double cumulativeQty = bidsCumulativeQuantities_[i]; // Cumulative quantity
+        if (std::isnan(levelQty) || std::isinf(levelQty) || levelQty < 0)
+            levelQty = 0.0;
+        if (std::isnan(cumulativeQty) || std::isinf(cumulativeQty) || cumulativeQty < 0)
             cumulativeQty = 0.0;
+        
+        // Calculate normalized percentage for animation (0-1 range)
+        double normalizedPercentage = 0.0;
+        if (cumulativeQty > 0.0 && maxCumulative > 0.0)
+        {
+            normalizedPercentage = std::min(std::max(cumulativeQty * maxCumulativeInv, 0.0), 1.0);
+        }
         
         std::string priceStr = ::margelo::nitro::cxpmobile_tpsdk::formatNumberWithDecimalsAndCommas(
                                                                                                     roundedPrice, priceDisplayDecimals);
         std::string amountStr = ::margelo::nitro::cxpmobile_tpsdk::formatNumberWithDecimalsAndCommas(
-                                                                                                     cumulativeQty, baseDecimals);
+                                                                                                     levelQty, baseDecimals);
         std::string cumulativeQtyStr = ::margelo::nitro::cxpmobile_tpsdk::formatNumberWithDecimalsOnly(
                                                                                                        cumulativeQty, baseDecimals);
         
-        asksItems.emplace_back(
+        bidsItems_.emplace_back(
                                std::make_optional<std::variant<nitro::NullType, std::string>>(std::move(priceStr)),
                                std::make_optional<std::variant<nitro::NullType, std::string>>(std::move(amountStr)),
-                               std::make_optional<std::variant<nitro::NullType, std::string>>(std::move(cumulativeQtyStr)));
+                               std::make_optional<std::variant<nitro::NullType, std::string>>(std::move(cumulativeQtyStr)),
+                               std::make_optional<double>(cumulativeQty),
+                               std::make_optional<double>(normalizedPercentage));
     }
     
-    while (asksItems.size() < static_cast<size_t>(maxRows))
+    // Step 6: Create display items from sliced top maxRows with cumulative quantities (asks)
+    asksItems_.reserve(maxRows);
+    
+    for (size_t i = 0; i < aggregatedAsksSize && i < asksCumulativeQuantities_.size(); i++)
     {
-        asksItems.emplace_back(
-                               std::make_optional<std::variant<nitro::NullType, std::string>>(nitro::NullType()),
-                               std::make_optional<std::variant<nitro::NullType, std::string>>(nitro::NullType()),
-                               std::make_optional<std::variant<nitro::NullType, std::string>>(nitro::NullType()));
+        double roundedPrice = aggregatedAsksVec_[i].first;
+        double levelQty = aggregatedAsksVec_[i].second; // Level quantity (not cumulative)
+        double cumulativeQty = asksCumulativeQuantities_[i]; // Cumulative quantity
+        if (std::isnan(levelQty) || std::isinf(levelQty) || levelQty < 0)
+            levelQty = 0.0;
+        if (std::isnan(cumulativeQty) || std::isinf(cumulativeQty) || cumulativeQty < 0)
+            cumulativeQty = 0.0;
+        
+        // Calculate normalized percentage for animation (0-1 range)
+        double normalizedPercentage = 0.0;
+        if (cumulativeQty > 0.0 && maxCumulative > 0.0)
+        {
+            normalizedPercentage = std::min(std::max(cumulativeQty * maxCumulativeInv, 0.0), 1.0);
+        }
+        
+        std::string priceStr = ::margelo::nitro::cxpmobile_tpsdk::formatNumberWithDecimalsAndCommas(
+                                                                                                    roundedPrice, priceDisplayDecimals);
+        std::string amountStr = ::margelo::nitro::cxpmobile_tpsdk::formatNumberWithDecimalsAndCommas(
+                                                                                                     levelQty, baseDecimals);
+        std::string cumulativeQtyStr = ::margelo::nitro::cxpmobile_tpsdk::formatNumberWithDecimalsOnly(
+                                                                                                       cumulativeQty, baseDecimals);
+        
+        asksItems_.emplace_back(
+                               std::make_optional<std::variant<nitro::NullType, std::string>>(std::move(priceStr)),
+                               std::make_optional<std::variant<nitro::NullType, std::string>>(std::move(amountStr)),
+                               std::make_optional<std::variant<nitro::NullType, std::string>>(std::move(cumulativeQtyStr)),
+                               std::make_optional<double>(cumulativeQty),
+                               std::make_optional<double>(normalizedPercentage));
     }
     
     if (std::isnan(maxCumulative) || std::isinf(maxCumulative) || maxCumulative < 0.0)
     {
         maxCumulative = 0.0;
+        maxCumulativeInv = 0.0;
     }
     std::string maxCumulativeStr = ::margelo::nitro::cxpmobile_tpsdk::formatDouble(maxCumulative);
     if (maxCumulativeStr.empty() || maxCumulativeStr == "." || maxCumulativeStr == "-")
     {
         maxCumulativeStr = "0";
     }
-    return OrderBookViewResult(std::move(bidsItems), std::move(asksItems), maxCumulativeStr);
+    
+    // Prepare optional values for OrderBookViewResult
+    std::optional<double> maxCumulativeNumOpt = maxCumulative > 0.0 ? std::make_optional<double>(maxCumulative) : std::nullopt;
+    std::optional<double> maxCumulativeInvOpt = maxCumulativeInv > 0.0 ? std::make_optional<double>(maxCumulativeInv) : std::nullopt;
+    
+    // Move vectors to result - create new vectors to avoid keeping capacity in thread_local
+    // This prevents memory buildup when vectors grow large
+    std::vector<OrderBookViewItem> bidsItemsFinal;
+    std::vector<OrderBookViewItem> asksItemsFinal;
+    bidsItemsFinal.reserve(bidsItems_.size());
+    asksItemsFinal.reserve(asksItems_.size());
+    bidsItemsFinal = std::move(bidsItems_);
+    asksItemsFinal = std::move(asksItems_);
+    
+    // Clear and shrink thread_local vectors to release memory immediately
+    bidsItems_.clear();
+    asksItems_.clear();
+    bidsItems_.shrink_to_fit();
+    asksItems_.shrink_to_fit();
+    
+    return OrderBookViewResult(std::move(bidsItemsFinal), std::move(asksItemsFinal), std::move(maxCumulativeStr), maxCumulativeNumOpt, maxCumulativeInvOpt);
 }
 
 void computeAndCacheAggregatedMaps(
@@ -281,6 +340,8 @@ void computeAndCacheAggregatedMaps(
         // Recompute aggregated maps
         state->cachedAggregatedBids.clear();
         state->cachedAggregatedAsks.clear();
+        // Note: cachedAggregatedBids and cachedAggregatedAsks are std::map, not std::vector
+        // std::map doesn't have shrink_to_fit(), but clear() already releases memory
         
         const auto& bidsVec = state->getBidsVector();
         const auto& asksVec = state->getAsksVector();

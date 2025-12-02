@@ -27,10 +27,93 @@ export function OrderBookScreen({ ws }: OrderBookScreenProps) {
   const setOrderBook = useTradingStore((state) => state.setOrderBook);
   const [aggregation, setAggregation] = useState('0.01');
   const subscriptionIdRef = useRef<string | null>(null);
+  const [useFakeStream, setUseFakeStream] = useState(true); // Enable fake stream by default
+  const fakeStreamIntervalRef = useRef<ReturnType<typeof setInterval> | null>(
+    null
+  );
+  const fakeStreamBasePriceRef = useRef<number>(3000);
+  const fakeStreamPriceDirectionRef = useRef<number>(1); // 1 for up, -1 for down
 
-  // Subscribe to WebSocket depth stream and handle messages
+  // Fake stream function to generate and send fake depth data
+  const sendFakeDepthUpdate = useCallback(() => {
+    const basePrice = fakeStreamBasePriceRef.current;
+    const numLevels = 20;
+    const priceStep = 0.5;
+
+    // Generate fake bids and asks with slight price movement
+    const bids: [string, string][] = [];
+    const asks: [string, string][] = [];
+
+    for (let i = 1; i <= numLevels; i++) {
+      const bidPrice = (basePrice - i * priceStep).toFixed(2);
+      const askPrice = (basePrice + i * priceStep).toFixed(2);
+      // Random quantity with some variation
+      const quantity = (Math.random() * 10 + 1).toFixed(8);
+
+      bids.push([bidPrice, quantity]);
+      asks.push([askPrice, quantity]);
+    }
+
+    // Create fake depth update message in CXP format
+    const timestamp = Date.now();
+    const fakeMessage = JSON.stringify({
+      stream: `${DEFAULT_SYMBOL}@depth`,
+      data: {
+        e: 'depthUpdate',
+        E: timestamp,
+        s: DEFAULT_SYMBOL,
+        U: '1',
+        u: '2',
+        b: bids,
+        a: asks,
+      },
+    });
+
+    // Process message through SDK - automatically triggers callbacks
+    TpSdk.parseMessage(fakeMessage);
+
+    // Update base price with slight movement (simulate market movement)
+    const priceChange = (Math.random() - 0.5) * 2; // -1 to +1
+    fakeStreamBasePriceRef.current += priceChange;
+
+    // Reverse direction if price moves too far
+    if (fakeStreamBasePriceRef.current > 3100) {
+      fakeStreamPriceDirectionRef.current = -1;
+    } else if (fakeStreamBasePriceRef.current < 2900) {
+      fakeStreamPriceDirectionRef.current = 1;
+    }
+  }, []);
+
+  // Fake stream interval
   useEffect(() => {
-    if (!ws) {
+    if (!useFakeStream) {
+      // Clear interval if fake stream is disabled
+      if (fakeStreamIntervalRef.current) {
+        clearInterval(fakeStreamIntervalRef.current);
+        fakeStreamIntervalRef.current = null;
+      }
+      return;
+    }
+
+    // Start fake stream - send updates every 100ms (10 updates per second)
+    fakeStreamIntervalRef.current = setInterval(() => {
+      sendFakeDepthUpdate();
+    }, 100);
+
+    console.log('[OrderBookScreen] Fake depth stream started');
+
+    return () => {
+      if (fakeStreamIntervalRef.current) {
+        clearInterval(fakeStreamIntervalRef.current);
+        fakeStreamIntervalRef.current = null;
+        console.log('[OrderBookScreen] Fake depth stream stopped');
+      }
+    };
+  }, [useFakeStream, sendFakeDepthUpdate]);
+
+  // Subscribe to WebSocket depth stream and handle messages (only if not using fake stream)
+  useEffect(() => {
+    if (useFakeStream || !ws) {
       return;
     }
 
@@ -84,7 +167,7 @@ export function OrderBookScreen({ ws }: OrderBookScreenProps) {
       ws.removeEventListener('open', handleOpen);
       ws.removeEventListener('message', handleMessage);
     };
-  }, [ws]);
+  }, [ws, useFakeStream]);
 
   // Initialize SDK if not already initialized
   useEffect(() => {
@@ -230,11 +313,18 @@ export function OrderBookScreen({ ws }: OrderBookScreenProps) {
     try {
       TpSdk.orderbook.reset();
       setOrderBook(null);
+      // Reset fake stream base price
+      fakeStreamBasePriceRef.current = 3000;
       console.log('[OrderBookScreen] Reset orderbook');
     } catch (error) {
       console.error('[OrderBookScreen] Error resetting orderbook:', error);
     }
   }, [setOrderBook]);
+
+  // Toggle fake stream
+  const handleToggleFakeStream = useCallback(() => {
+    setUseFakeStream((prev) => !prev);
+  }, []);
 
   return (
     <SafeAreaView style={styles.container}>
@@ -254,6 +344,19 @@ export function OrderBookScreen({ ws }: OrderBookScreenProps) {
             onPress={handleReset}
           >
             <Text style={styles.headerButtonText}>Reset</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[
+              styles.headerButton,
+              useFakeStream
+                ? styles.fakeStreamActiveButton
+                : styles.fakeStreamButton,
+            ]}
+            onPress={handleToggleFakeStream}
+          >
+            <Text style={styles.headerButtonText}>
+              {useFakeStream ? 'Fake Stream ON' : 'Fake Stream OFF'}
+            </Text>
           </TouchableOpacity>
           <TouchableOpacity
             style={[styles.headerButton, styles.fakeButton]}
@@ -346,6 +449,12 @@ const styles = StyleSheet.create({
   },
   fakeButton: {
     backgroundColor: '#f6465d',
+  },
+  fakeStreamButton: {
+    backgroundColor: '#2a2e39',
+  },
+  fakeStreamActiveButton: {
+    backgroundColor: '#0ecb81',
   },
   headerButtonText: {
     color: '#ffffff',

@@ -21,6 +21,7 @@
 #include <queue>
 #include <thread>
 #include <mutex>
+#include <chrono>
 #if __cplusplus >= 201402L || (defined(_MSC_VER) && _MSC_VER >= 1900)
 #include <shared_mutex>
 #else
@@ -68,13 +69,15 @@ namespace margelo::nitro::cxpmobile_tpsdk
 
         // Default values as constants
         static constexpr int DEFAULT_ORDERBOOK_MAX_ROWS = 50;
-        static constexpr int DEFAULT_ORDERBOOK_DEPTH_LIMIT = 1000; // Giữ 1000 levels, clear data cũ
+        static constexpr int DEFAULT_ORDERBOOK_DEPTH_LIMIT = 1000; // Keep 1000 levels, clear old data
         static constexpr int DEFAULT_TRADES_MAX_ROWS = 50;
         static constexpr int DEFAULT_ORDERBOOK_BASE_DECIMALS = 5;
         static constexpr int DEFAULT_ORDERBOOK_PRICE_DISPLAY_DECIMALS = 2;
         static constexpr const char *DEFAULT_ORDERBOOK_AGGREGATION = "0.01";
-        static constexpr size_t MAX_CALLBACK_QUEUE_SIZE = 50; // Prevent memory buildup (reduced from 100)
+        static constexpr size_t MAX_CALLBACK_QUEUE_SIZE = 10; // Reduced from 50 to prevent memory buildup
         static constexpr size_t MAX_MESSAGE_QUEUE_SIZE = 20;  // Small buffer for burst messages (Zustand stores final result)
+        // Throttle orderbook callbacks to max 10 updates/second (100ms interval)
+        static constexpr std::chrono::milliseconds ORDERBOOK_THROTTLE_INTERVAL{100};
 
         // Singleton pattern: Get the singleton instance
         // Returns the first instance created by Nitro
@@ -219,8 +222,6 @@ namespace margelo::nitro::cxpmobile_tpsdk
         void klineUnsubscribe() override;
         void userDataSubscribe(const std::function<void(const UserMessageData &)> &callback) override;
         void userDataUnsubscribe() override;
-        // Trading pair management removed - app manages trading pairs
-        // Decimals are passed as optional parameters to orderbook methods
         void tradesSubscribe(const std::function<void(const TradeMessageData &)> &callback) override;
         void tradesUnsubscribe() override;
         void tradesReset() override;
@@ -232,12 +233,6 @@ namespace margelo::nitro::cxpmobile_tpsdk
 
         // Override methods from HybridTpSdkSpec (kept for generated interface compatibility)
         // These methods are internal and should not be used directly - use the non-override versions below
-        // Note: orderbookConfigSetAggregation with symbol parameter is not in base class, so no override
-        void orderbookConfigSetAggregation(const std::string &symbol, const std::string &aggregationStr);
-        // Note: orderbookDataSetSnapshot with symbol parameter is not in base class, so no override
-        void orderbookDataSetSnapshot(const std::string &symbol,
-                                      const std::vector<std::tuple<std::string, std::string>> &bids,
-                                      const std::vector<std::tuple<std::string, std::string>> &asks);
         void orderbookConfigSetDecimals(std::optional<double> baseDecimals, std::optional<double> quoteDecimals) override;
         void orderbookDataSetSnapshot(
             const std::vector<std::tuple<std::string, std::string>> &bids,
@@ -374,16 +369,8 @@ namespace margelo::nitro::cxpmobile_tpsdk
         // Helper: Manage callback queue size (drop old callbacks if needed)
         static void manageCallbackQueueSize(size_t dropRatio = 4);
 
-        // Trading pair helper methods removed - decimals are passed as parameters
-
-        // Symbol-scoped state helpers removed - single-symbol state is now direct members
-
     public:
-        // Trading pair management removed - app manages trading pairs
-        // Decimals are passed as optional parameters to methods
-
-        // Symbol-scoped state structures
-        // Public to allow StateManager (namespace functions) to access
+        // State structures for single-symbol state (direct members, no map needed)
         struct OrderBookState
         {
             // Use unordered_map for efficient O(1) updates instead of O(n) vector operations
@@ -410,7 +397,7 @@ namespace margelo::nitro::cxpmobile_tpsdk
 
             std::string aggregationStr;
             int maxRows;
-            int depthLimit; // Giới hạn số levels trong map (clear data cũ khi vượt quá)
+            int depthLimit; // Limit number of levels in map (clear old data when exceeded)
             int baseDecimals;
             int priceDisplayDecimals;
             std::mutex mutex;
@@ -515,6 +502,11 @@ namespace margelo::nitro::cxpmobile_tpsdk
                 cachedBaseDecimals = -1;
                 cachedPriceDisplayDecimals = -1;
                 cachedMaxRows = -1;
+                // Shrink vectors to free memory
+                bidsCache.shrink_to_fit();
+                asksCache.shrink_to_fit();
+                // Note: cachedAggregatedBids and cachedAggregatedAsks are std::map, not std::vector
+                // std::map doesn't have shrink_to_fit(), but clear() already releases memory
             }
 
             // Shrink cache vectors to reduce memory footprint
@@ -522,6 +514,8 @@ namespace margelo::nitro::cxpmobile_tpsdk
             {
                 bidsCache.shrink_to_fit();
                 asksCache.shrink_to_fit();
+                // Note: cachedAggregatedBids and cachedAggregatedAsks are std::map, not std::vector
+                // std::map doesn't have shrink_to_fit(), but clear() already releases memory
             }
 
             void clear()
@@ -543,6 +537,8 @@ namespace margelo::nitro::cxpmobile_tpsdk
                 // Shrink vectors to free memory
                 bidsCache.shrink_to_fit();
                 asksCache.shrink_to_fit();
+                // Note: cachedAggregatedBids and cachedAggregatedAsks are std::map, not std::vector
+                // std::map doesn't have shrink_to_fit(), but clear() already releases memory
             }
         };
 
@@ -557,6 +553,32 @@ namespace margelo::nitro::cxpmobile_tpsdk
             TradesState() : maxRows(DEFAULT_TRADES_MAX_ROWS),
                             priceDecimals(2),
                             quantityDecimals(8) {}
+            
+            // Optimize memory by rebuilding queue if it has grown too large
+            // std::deque doesn't have shrink_to_fit, so we rebuild if capacity is excessive
+            void optimizeMemory()
+            {
+                // If queue is much smaller than maxRows, rebuild it to reduce memory
+                // This is a heuristic - deque doesn't expose capacity, so we check size
+                // Rebuild if we've recently trimmed and size is small compared to maxRows
+                if (queue.size() < static_cast<size_t>(maxRows) / 2 && queue.size() > 0)
+                {
+                    std::deque<TradeMessageData> newQueue;
+                    // Move elements to new deque to potentially reduce internal fragmentation
+                    for (auto& item : queue)
+                    {
+                        newQueue.push_back(std::move(item));
+                    }
+                    queue = std::move(newQueue);
+                }
+            }
+            
+            void clear()
+            {
+                queue.clear();
+                // After clear, deque should release memory, but we can't force it
+                // The destructor will handle it
+            }
         };
 
         struct KlineState
@@ -565,6 +587,24 @@ namespace margelo::nitro::cxpmobile_tpsdk
             std::mutex mutex;
 
             KlineState() {}
+            
+            // Optimize memory by rehashing if map has many empty buckets
+            void optimizeMemory()
+            {
+                // Rehash to reduce memory if map has grown and then shrunk
+                // This helps reduce empty buckets
+                if (data.size() > 0)
+                {
+                    data.rehash(data.size()); // Rehash to fit current size
+                }
+            }
+            
+            void clear()
+            {
+                data.clear();
+                // After clear, rehash to minimum to free memory
+                data.rehash(0);
+            }
         };
 
         struct TickerState
@@ -577,14 +617,12 @@ namespace margelo::nitro::cxpmobile_tpsdk
         };
 
         // Single-symbol state (direct members, no map needed)
-        // Public to allow managers (namespace functions) to access
         OrderBookState orderBookState_;
         TradesState tradesState_;
         KlineState klineState_;
         TickerState tickerState_;
 
         // Subscription callbacks and mutexes
-        // Public to allow managers (namespace functions) to access
         // Note: This is internal SDK implementation, not exposed to external API
         std::function<void(const OrderBookViewResult &)> orderBookCallback_;
         std::mutex orderBookCallbackMutex_;
@@ -605,17 +643,23 @@ namespace margelo::nitro::cxpmobile_tpsdk
         std::mutex tradesCallbackMutex_;
 
         // Global all tickers state (for !miniTicker@arr)
-        // Public to allow managers (namespace functions) to access
         std::vector<TickerMessageData> allTickersData_;
         std::mutex allTickersMutex_;
 
+        // OrderBook callback throttling state
+        struct OrderBookCallbackState {
+            std::chrono::steady_clock::time_point lastCallbackTime;
+            OrderBookViewResult lastQueuedResult;
+            bool hasLastResult = false;
+            std::mutex mutex;
+        };
+        OrderBookCallbackState orderBookCallbackState_;
+
         // Initialization state
-        // Public to allow LifecycleManager (namespace functions) to access
         std::atomic<bool> isInitialized_;
         std::mutex initializationMutex_;
 
         // OrderBook helper methods
-        // Public to allow managers (namespace functions) to access
         OrderBookViewResult formatOrderBookView(
             const std::vector<OrderBookLevel> &bids,
             const std::vector<OrderBookLevel> &asks);

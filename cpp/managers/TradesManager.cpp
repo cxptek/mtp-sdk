@@ -29,7 +29,7 @@ namespace margelo::nitro::cxpmobile_tpsdk
                 return;
             }
             std::lock_guard<std::mutex> lock(instance->tradesState_.mutex);
-            instance->tradesState_.queue.clear();
+            instance->tradesState_.clear();
         }
 
         void tradesConfigSetDecimals(TpSdkCppHybrid* instance, std::optional<int> priceDecimals, std::optional<int> quantityDecimals)

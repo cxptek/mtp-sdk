@@ -159,12 +159,12 @@ namespace margelo::nitro::cxpmobile_tpsdk
 
                 {
                     std::lock_guard<std::mutex> lock(oldInstance->tradesState_.mutex);
-                    oldInstance->tradesState_.queue.clear();
+                    oldInstance->tradesState_.clear();
                 }
 
                 {
                     std::lock_guard<std::mutex> lock(oldInstance->klineState_.mutex);
-                    oldInstance->klineState_.data.clear();
+                    oldInstance->klineState_.clear();
                 }
 
                 {

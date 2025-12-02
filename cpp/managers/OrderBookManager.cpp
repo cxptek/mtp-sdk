@@ -76,13 +76,11 @@ namespace margelo::nitro::cxpmobile_tpsdk
         {
             if (instance == nullptr)
             {
-                std::cerr << "[C++ DEBUG] orderbookSubscribe: instance is null" << std::endl;
                 return;
             }
 
             std::lock_guard<std::mutex> lock(instance->orderBookCallbackMutex_);
             instance->orderBookCallback_ = callback;
-            std::cerr << "[C++ DEBUG] orderbookSubscribe: callback registered" << std::endl;
         }
 
         void orderbookUnsubscribe(TpSdkCppHybrid *instance)

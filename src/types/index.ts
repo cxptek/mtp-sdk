@@ -17,12 +17,16 @@ export interface OrderBookViewItem {
   priceStr: string | null;
   amountStr: string | null;
   cumulativeQuantity: string | null;
+  cumulativeQuantityNum?: number;
+  normalizedPercentage?: number;
 }
 
 export interface OrderBookViewResult {
   bids: OrderBookViewItem[];
   asks: OrderBookViewItem[];
   maxCumulativeQuantity: string;
+  maxCumulativeQuantityNum?: number;
+  maxCumulativeInv?: number;
 }
 
 export interface UpsertOrderBookResult {
