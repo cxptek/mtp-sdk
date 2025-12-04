@@ -1,9 +1,7 @@
 #include "TpSdkCppHybrid.hpp"
+// Include template headers after TpSdkCppHybrid.hpp to ensure nested types are available
 #include "WebSocketMessageProcessor.hpp"
 #include "Utils.hpp"
-#include "helpers/OrderBookHelpers.hpp"
-#include "formatters/OrderBookFormatter.hpp"
-#include "processors/MessageProcessor.hpp"
 #include "managers/OrderBookManager.hpp"
 #include "managers/TradesManager.hpp"
 #include "managers/KlineManager.hpp"
@@ -22,212 +20,36 @@
 #include <iostream>
 #include <thread>
 #include <chrono>
+#include <string_view>
 
 namespace margelo::nitro::cxpmobile_tpsdk
 {
-    std::queue<TpSdkCppHybrid::MessageTask> TpSdkCppHybrid::orderbookQueue_;
-    std::queue<TpSdkCppHybrid::MessageTask> TpSdkCppHybrid::lightweightQueue_;
+    // Object pools removed - no longer used (optimized processors use core::ObjectPool)
+
+    // Pre-allocated buffers (thread-local, initialized on first use)
+    thread_local TpSdkCppHybrid::PreAllocatedBuffers TpSdkCppHybrid::threadLocalBuffers_;
+
+    // Callback queue
     std::queue<TpSdkCppHybrid::CallbackTask> TpSdkCppHybrid::callbackQueue_;
-    std::mutex TpSdkCppHybrid::orderbookQueueMutex_;
-    std::mutex TpSdkCppHybrid::lightweightQueueMutex_;
     std::mutex TpSdkCppHybrid::callbackQueueMutex_;
-    std::condition_variable TpSdkCppHybrid::orderbookQueueCondition_;
-    std::condition_variable TpSdkCppHybrid::lightweightQueueCondition_;
-    std::thread TpSdkCppHybrid::orderbookWorkerThread_;
-    std::thread TpSdkCppHybrid::lightweightWorkerThread_;
-    std::atomic<bool> TpSdkCppHybrid::orderbookWorkerRunning_(false);
-    std::atomic<bool> TpSdkCppHybrid::lightweightWorkerRunning_(false);
-    bool TpSdkCppHybrid::orderbookWorkerInitialized_ = false;
-    bool TpSdkCppHybrid::lightweightWorkerInitialized_ = false;
 
     TpSdkCppHybrid *TpSdkCppHybrid::singletonInstance_ = nullptr;
     std::mutex TpSdkCppHybrid::singletonMutex_;
-
-    std::vector<OrderBookLevel> TpSdkCppHybrid::aggregateTopNFromLevels(
-        const std::vector<OrderBookLevel> &levels,
-        const std::string &aggregationStr,
-        bool isBid,
-        int n,
-        int buffer)
-    {
-        return OrderBookHelpers::aggregateTopNFromLevels(levels, aggregationStr, isBid, n, buffer);
-    }
-
-    std::string TpSdkCppHybrid::normalizePriceKey(const std::string &price)
-    {
-        return OrderBookHelpers::normalizePriceKey(price);
-    }
-
-    void TpSdkCppHybrid::trimOrderBookDepth(OrderBookState *state)
-    {
-        if (state == nullptr)
-            return;
-
-        // Note: Caller must hold state->mutex lock before calling this method
-
-        // Normalize price helper (same as in OrderBookHelpers)
-        auto normalizePriceForKey = [](double price) -> double
-        {
-            if (std::isnan(price) || std::isinf(price))
-                return price;
-            double factor = 1e10;
-            return std::round(price * factor) / factor;
-        };
-
-        // Trim bids: keep top depthLimit (highest prices), clear old data (lowest prices)
-        if (state->bidsMap.size() > static_cast<size_t>(state->depthLimit))
-        {
-            // Work directly with cache vector to avoid copy
-            // Ensure cache is up to date
-            if (state->bidsCacheDirty)
-            {
-                state->bidsCache.clear();
-                state->bidsCache.reserve(state->bidsMap.size());
-                for (const auto &[key, level] : state->bidsMap)
-                {
-                    state->bidsCache.push_back(level);
-                }
-            }
-
-            // Use partial_sort to only sort top depthLimit elements (O(n log k) instead of O(n log n))
-            size_t depthLimit = static_cast<size_t>(state->depthLimit);
-            if (state->bidsCache.size() > depthLimit)
-            {
-                // Partition: put top depthLimit highest prices at the beginning
-                std::partial_sort(
-                    state->bidsCache.begin(),
-                    state->bidsCache.begin() + depthLimit,
-                    state->bidsCache.end(),
-                    [](const OrderBookLevel &a, const OrderBookLevel &b)
-                    {
-                        return b.price > a.price; // Descending for bids
-                    });
-
-                // Resize to keep only top depthLimit
-                state->bidsCache.resize(depthLimit);
-
-                // Clear old map and rebuild with only top levels
-                state->bidsMap.clear();
-                for (const auto &level : state->bidsCache)
-                {
-                    double normalizedPrice = normalizePriceForKey(level.price);
-                    state->bidsMap[normalizedPrice] = level;
-                }
-
-                // Only mark sorted cache dirty (not aggregated/formatted cache)
-                state->bidsCacheDirty = false; // Cache is now valid
-            }
-        }
-
-        // Trim asks: keep top depthLimit (lowest prices), clear old data (highest prices)
-        if (state->asksMap.size() > static_cast<size_t>(state->depthLimit))
-        {
-            // Work directly with cache vector to avoid copy
-            // Ensure cache is up to date
-            if (state->asksCacheDirty)
-            {
-                state->asksCache.clear();
-                state->asksCache.reserve(state->asksMap.size());
-                for (const auto &[key, level] : state->asksMap)
-                {
-                    state->asksCache.push_back(level);
-                }
-            }
-
-            // Use partial_sort to only sort top depthLimit elements (O(n log k) instead of O(n log n))
-            size_t depthLimit = static_cast<size_t>(state->depthLimit);
-            if (state->asksCache.size() > depthLimit)
-            {
-                // Partition: put top depthLimit lowest prices at the beginning
-                std::partial_sort(
-                    state->asksCache.begin(),
-                    state->asksCache.begin() + depthLimit,
-                    state->asksCache.end(),
-                    [](const OrderBookLevel &a, const OrderBookLevel &b)
-                    {
-                        return a.price < b.price; // Ascending for asks
-                    });
-
-                // Resize to keep only top depthLimit
-                state->asksCache.resize(depthLimit);
-
-                // Clear old map and rebuild with only top levels
-                state->asksMap.clear();
-                for (const auto &level : state->asksCache)
-                {
-                    double normalizedPrice = normalizePriceForKey(level.price);
-                    state->asksMap[normalizedPrice] = level;
-                }
-
-                // Only mark sorted cache dirty (not aggregated/formatted cache)
-                state->asksCacheDirty = false; // Cache is now valid
-            }
-        }
-
-        // Invalidate aggregated and formatted caches since data changed
-        state->aggregatedCacheDirty = true;
-        state->formattedCacheDirty = true;
-    }
-
-    std::vector<OrderBookLevel> TpSdkCppHybrid::upsertOrderBookLevels(
-        const std::vector<OrderBookLevel> &prev,
-        const std::vector<OrderBookLevel> &changes,
-        bool isBid,
-        int depthLimit)
-    {
-        return OrderBookHelpers::upsertOrderBookLevels(prev, changes, isBid, depthLimit);
-    }
-
-    void TpSdkCppHybrid::upsertOrderBookLevelsToMap(
-        std::unordered_map<double, OrderBookLevel> &levelMap,
-        const std::vector<OrderBookLevel> &changes)
-    {
-        OrderBookHelpers::upsertOrderBookLevelsToMap(levelMap, changes);
-    }
-
-    void TpSdkCppHybrid::computeAndCacheAggregatedMaps(
-        TpSdkCppHybrid::OrderBookState *state,
-        const std::string &aggregationStr,
-        double agg,
-        int decimals)
-    {
-        OrderBookFormatter::computeAndCacheAggregatedMaps(static_cast<void *>(state), aggregationStr, agg, decimals, this);
-    }
-
-    int TpSdkCppHybrid::calculatePriceDisplayDecimals(const std::string &aggregationStr)
-    {
-        return OrderBookFormatter::calculatePriceDisplayDecimals(aggregationStr);
-    }
+    // useOptimizedProcessors_ removed - always use optimized processors
 
     std::variant<nitro::NullType, WebSocketMessageResultNitro> TpSdkCppHybrid::processWebSocketMessage(
         const std::string &messageJson)
     {
         TpSdkCppHybrid *instance = getOrCreateSingletonInstance();
+        if (instance == nullptr)
+        {
+            return nitro::NullType{};
+        }
         TpSdkCppHybrid::routeMessageToQueue(messageJson, instance);
         return nitro::NullType{};
     }
 
-    OrderBookViewResult TpSdkCppHybrid::orderbookUpsertLevel(
-        const std::vector<OrderBookLevel> &bids,
-        const std::vector<OrderBookLevel> &asks)
-    {
-        TpSdkCppHybrid *instance = getOrCreateSingletonInstance();
-        return OrderBookManager::orderbookUpsertLevel(instance, bids, asks);
-    }
-
-    void TpSdkCppHybrid::orderbookReset()
-    {
-        TpSdkCppHybrid *instance = getOrCreateSingletonInstance();
-        OrderBookManager::orderbookReset(instance);
-    }
-
-    std::variant<nitro::NullType, OrderBookViewResult> TpSdkCppHybrid::orderbookGetViewResult()
-    {
-        TpSdkCppHybrid *instance = getOrCreateSingletonInstance();
-        return OrderBookManager::orderbookGetViewResult(instance);
-    }
-
-    void TpSdkCppHybrid::orderbookSubscribe(const std::function<void(const OrderBookViewResult &)> &callback)
+    void TpSdkCppHybrid::orderbookSubscribe(const std::function<void(const OrderBookMessageData &)> &callback)
     {
         TpSdkCppHybrid *instance = getOrCreateSingletonInstance();
         OrderBookManager::orderbookSubscribe(instance, callback);
@@ -287,7 +109,7 @@ namespace margelo::nitro::cxpmobile_tpsdk
         UserDataManager::userDataUnsubscribe(instance);
     }
 
-    void TpSdkCppHybrid::tradesSubscribe(const std::function<void(const TradeMessageData &)> &callback)
+    void TpSdkCppHybrid::tradesSubscribe(const std::function<void(const std::vector<TradeMessageData> &)> &callback)
     {
         TpSdkCppHybrid *instance = getOrCreateSingletonInstance();
         TradesManager::tradesSubscribe(instance, callback);
@@ -299,87 +121,88 @@ namespace margelo::nitro::cxpmobile_tpsdk
         TradesManager::tradesUnsubscribe(instance);
     }
 
-    void TpSdkCppHybrid::tradesReset()
+    // Old worker thread functions removed - using optimized processors only
+
+    void TpSdkCppHybrid::initializeOptimizedProcessors()
     {
-        TpSdkCppHybrid *instance = getOrCreateSingletonInstance();
-        TradesManager::tradesReset(instance);
+        try
+        {
+            // Create processors with appropriate pool sizes
+            depthProcessor_ = std::make_unique<core::DepthProcessor>(100, 200);
+            tradeProcessor_ = std::make_unique<core::TradeProcessor>(50, 100);
+            tickerProcessor_ = std::make_unique<core::TickerProcessor>(100, 200);
+            miniTickerProcessor_ = std::make_unique<core::MiniTickerProcessor>(100, 200);
+            klineProcessor_ = std::make_unique<core::KlineProcessor>(50, 100);
+            userDataProcessor_ = std::make_unique<core::UserDataProcessor>(20, 40);
+
+            // Start processors with callbacks that convert to Nitro types
+            depthProcessor_->start([this](const core::DepthData &data)
+                                   { this->onOptimizedDepthUpdate(data); });
+
+            tradeProcessor_->start([this](const core::TradeData &data)
+                                   { this->onOptimizedTradeUpdate(data); });
+
+            tickerProcessor_->start([this](const core::TickerData &data)
+                                    { this->onOptimizedTickerUpdate(data); });
+
+            miniTickerProcessor_->start([this](const core::MiniTickerData &data)
+                                        { this->onOptimizedMiniTickerUpdate(data); });
+
+            klineProcessor_->start([this](const core::KlineData &data)
+                                   { this->onOptimizedKlineUpdate(data); });
+
+            userDataProcessor_->start([this](const core::UserData &data)
+                                      { this->onOptimizedUserDataUpdate(data); });
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "[TpSdkCppHybrid] Failed to initialize optimized processors: " << e.what() << std::endl;
+            // Processors are required - rethrow or handle error appropriately
+        }
     }
 
-    OrderBookViewResult TpSdkCppHybrid::formatOrderBookView(
-        const std::vector<OrderBookLevel> &bids,
-        const std::vector<OrderBookLevel> &asks)
+    void TpSdkCppHybrid::onOptimizedDepthUpdate(const core::DepthData &data)
     {
-        std::lock_guard<std::mutex> lock(orderBookState_.mutex);
-
-        return OrderBookFormatter::formatOrderBookView(
-            bids,
-            asks,
-            orderBookState_.aggregationStr,
-            orderBookState_.baseDecimals,
-            orderBookState_.priceDisplayDecimals,
-            orderBookState_.maxRows,
-            this);
+        // Convert to Nitro type and queue callback
+        auto orderBookData = core::DataConverter::convertDepth(data);
+        queueOrderBookCallback(std::move(orderBookData), this);
     }
 
-    OrderBookViewResult TpSdkCppHybrid::formatOrderBookView(
-        const std::vector<OrderBookLevel> &bids,
-        const std::vector<OrderBookLevel> &asks,
-        const std::string &aggregationStr,
-        int baseDecimals,
-        int priceDisplayDecimals,
-        int maxRows)
+    void TpSdkCppHybrid::onOptimizedTradeUpdate(const core::TradeData &data)
     {
-        return OrderBookFormatter::formatOrderBookView(
-            bids,
-            asks,
-            aggregationStr,
-            baseDecimals,
-            priceDisplayDecimals,
-            maxRows,
-            this);
+        // Convert to Nitro type and queue callback
+        auto tradeData = core::DataConverter::convertTrade(data);
+        std::vector<TradeMessageData> batch;
+        batch.push_back(std::move(tradeData));
+        queueTradeCallback(std::move(batch), this);
     }
 
-    OrderBookViewResult TpSdkCppHybrid::formatOrderBookViewFromAggregatedMaps(
-        const std::map<double, double> &aggregatedBids,
-        const std::map<double, double> &aggregatedAsks,
-        int baseDecimals,
-        int priceDisplayDecimals,
-        int maxRows)
+    void TpSdkCppHybrid::onOptimizedTickerUpdate(const core::TickerData &data)
     {
-        return OrderBookFormatter::formatOrderBookViewFromAggregatedMaps(
-            aggregatedBids,
-            aggregatedAsks,
-            baseDecimals,
-            priceDisplayDecimals,
-            maxRows);
+        // Convert to Nitro type and queue callback
+        auto tickerData = core::DataConverter::convertTicker(data);
+        queueMiniTickerCallback(std::move(tickerData), this);
     }
 
-    void TpSdkCppHybrid::initializeOrderbookWorkerThread()
+    void TpSdkCppHybrid::onOptimizedMiniTickerUpdate(const core::MiniTickerData &data)
     {
-        if (orderbookWorkerInitialized_)
-            return;
-
-        std::lock_guard<std::mutex> lock(singletonMutex_);
-        if (orderbookWorkerInitialized_)
-            return;
-
-        orderbookWorkerRunning_ = true;
-        orderbookWorkerThread_ = std::thread(&TpSdkCppHybrid::orderbookWorkerThreadFunction);
-        orderbookWorkerInitialized_ = true;
+        // Convert to Nitro type and queue callback
+        auto tickerData = core::DataConverter::convertMiniTicker(data);
+        queueMiniTickerCallback(std::move(tickerData), this);
     }
 
-    void TpSdkCppHybrid::initializeLightweightWorkerThread()
+    void TpSdkCppHybrid::onOptimizedKlineUpdate(const core::KlineData &data)
     {
-        if (lightweightWorkerInitialized_)
-            return;
+        // Convert to Nitro type and queue callback
+        auto klineData = core::DataConverter::convertKline(data);
+        queueKlineCallback(std::move(klineData), this);
+    }
 
-        std::lock_guard<std::mutex> lock(singletonMutex_);
-        if (lightweightWorkerInitialized_)
-            return;
-
-        lightweightWorkerRunning_ = true;
-        lightweightWorkerThread_ = std::thread(&TpSdkCppHybrid::lightweightWorkerThreadFunction);
-        lightweightWorkerInitialized_ = true;
+    void TpSdkCppHybrid::onOptimizedUserDataUpdate(const core::UserData &data)
+    {
+        // Convert to Nitro type and queue callback
+        auto userData = core::DataConverter::convertUserData(data);
+        queueUserDataCallback(std::move(userData), this);
     }
 
     void TpSdkCppHybrid::routeMessageToQueue(const std::string &messageJson, TpSdkCppHybrid *instance)
@@ -389,77 +212,54 @@ namespace margelo::nitro::cxpmobile_tpsdk
             return;
         }
 
-        bool isOrderbookMessage = false;
-        try
-        {
-            nlohmann::json j = nlohmann::json::parse(messageJson);
-            if (j.is_object() && j.contains("stream"))
-            {
-                std::string stream = j.value("stream", std::string());
-                isOrderbookMessage = (stream.find("@depth") != std::string::npos);
-            }
-            else if (j.is_object() && j.contains("e"))
-            {
-                std::string eventType = j.value("e", std::string());
-                isOrderbookMessage = (eventType == "depthUpdate");
-            }
-            else
-            {
-                isOrderbookMessage = (messageJson.find("@depth") != std::string::npos ||
-                                      messageJson.find("\"e\":\"depthUpdate\"") != std::string::npos);
-            }
-        }
-        catch (...)
-        {
-            isOrderbookMessage = (messageJson.find("@depth") != std::string::npos ||
-                                  messageJson.find("\"e\":\"depthUpdate\"") != std::string::npos);
-        }
+        // Always use optimized processors
+        auto type = core::SimdjsonParser::detectMessageType(messageJson);
 
-        if (isOrderbookMessage)
+        switch (type)
         {
-            if (!orderbookWorkerInitialized_)
+        case core::MessageType::DEPTH:
+            if (instance->depthProcessor_)
             {
-                instance->initializeOrderbookWorkerThread();
+                instance->depthProcessor_->push(messageJson);
             }
-
+            break;
+        case core::MessageType::TRADE:
+            if (instance->tradeProcessor_)
             {
-                std::lock_guard<std::mutex> lock(orderbookQueueMutex_);
-                if (orderbookQueue_.size() >= MAX_MESSAGE_QUEUE_SIZE)
-                {
-                    orderbookQueue_.pop();
-                }
-                orderbookQueue_.push(MessageTask{messageJson, instance});
+                instance->tradeProcessor_->push(messageJson);
             }
-            orderbookQueueCondition_.notify_one();
-        }
-        else
-        {
-            if (!lightweightWorkerInitialized_)
+            break;
+        case core::MessageType::TICKER:
+            if (instance->tickerProcessor_)
             {
-                instance->initializeLightweightWorkerThread();
+                instance->tickerProcessor_->push(messageJson);
             }
-
+            break;
+        case core::MessageType::MINI_TICKER:
+            if (instance->miniTickerProcessor_)
             {
-                std::lock_guard<std::mutex> lock(lightweightQueueMutex_);
-                if (lightweightQueue_.size() >= MAX_MESSAGE_QUEUE_SIZE)
-                {
-                    lightweightQueue_.pop();
-                }
-                lightweightQueue_.push(MessageTask{messageJson, instance});
+                instance->miniTickerProcessor_->push(messageJson);
             }
-            lightweightQueueCondition_.notify_one();
+            break;
+        case core::MessageType::KLINE:
+            if (instance->klineProcessor_)
+            {
+                instance->klineProcessor_->push(messageJson);
+            }
+            break;
+        case core::MessageType::USER_DATA:
+            if (instance->userDataProcessor_)
+            {
+                instance->userDataProcessor_->push(messageJson);
+            }
+            break;
+        default:
+            // Unknown message types are ignored
+            break;
         }
     }
 
-    void TpSdkCppHybrid::processOrderbookMessage(MessageTask &task)
-    {
-        MessageProcessor::processOrderbookMessage(&task);
-    }
-
-    void TpSdkCppHybrid::processLightweightMessage(MessageTask &task)
-    {
-        MessageProcessor::processLightweightMessage(&task);
-    }
+    // Old message processing functions removed - using optimized processors only
 
     void TpSdkCppHybrid::manageCallbackQueueSize(size_t dropRatio)
     {
@@ -474,165 +274,60 @@ namespace margelo::nitro::cxpmobile_tpsdk
         }
     }
 
-    void TpSdkCppHybrid::queueOrderBookCallback(OrderBookViewResult viewResult, TpSdkCppHybrid *instance)
+    void TpSdkCppHybrid::queueOrderBookCallback(OrderBookMessageData &&orderBookData, TpSdkCppHybrid *instance)
     {
         if (instance == nullptr)
         {
+            std::cerr << "[TpSdkCppHybrid] queueOrderBookCallback: instance is null" << std::endl;
             return;
         }
 
-        std::function<void(const OrderBookViewResult &)> callback;
+        std::function<void(const OrderBookMessageData &)> callback;
         {
             std::lock_guard<std::mutex> callbackLock(instance->orderBookCallbackMutex_);
             if (!instance->orderBookCallback_)
             {
+                std::cerr << "[TpSdkCppHybrid] queueOrderBookCallback: callback not registered" << std::endl;
                 return;
             }
             callback = instance->orderBookCallback_;
         }
 
-        // Throttle: only queue if THROTTLE_INTERVAL has passed since last queue
-        auto now = std::chrono::steady_clock::now();
-        bool shouldQueue = true;
-
-        {
-            std::lock_guard<std::mutex> throttleLock(instance->orderBookCallbackState_.mutex);
-            auto &callbackState = instance->orderBookCallbackState_;
-
-            // First time: always queue (no last result to compare)
-            if (!callbackState.hasLastResult)
-            {
-                callbackState.lastCallbackTime = now;
-                callbackState.lastQueuedResult = viewResult; // Copy for comparison (not move yet)
-                callbackState.hasLastResult = true;
-                shouldQueue = true;
-            }
-            else
-            {
-                auto timeSinceLastCall = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    now - callbackState.lastCallbackTime);
-
-                // If not enough THROTTLE_INTERVAL, skip this callback (drop silently)
-                // But ensure at least 1 update every 200ms to prevent UI from being stale
-                if (timeSinceLastCall < TpSdkCppHybrid::ORDERBOOK_THROTTLE_INTERVAL)
-                {
-                    auto maxStaleTime = std::chrono::milliseconds(200);
-                    if (timeSinceLastCall >= maxStaleTime)
-                    {
-                        // Force queue after 200ms to ensure UI doesn't become stale
-                        callbackState.lastCallbackTime = now;
-                        callbackState.lastQueuedResult = viewResult;
-                        shouldQueue = true;
-                    }
-                    else
-                    {
-                        return; // Drop update, keep last result
-                    }
-                }
-                else
-                {
-                    // Enough throttle interval, continue with conditional check
-
-                    // Conditional update: only queue if there are significant changes
-                    // Simplified: only check top price and item count (most important for UI)
-                    const auto &last = callbackState.lastQueuedResult;
-
-                    // Compare item count (important - if changed, must update)
-                    bool itemsCountChanged =
-                        (last.bids.size() != viewResult.bids.size()) ||
-                        (last.asks.size() != viewResult.asks.size());
-
-                    // Compare top price changes (most important for UI)
-                    bool topPriceChanged = false;
-                    if (!last.bids.empty() && !viewResult.bids.empty())
-                    {
-                        const auto &lastTopBid = last.bids[0];
-                        const auto &newTopBid = viewResult.bids[0];
-                        if (lastTopBid.priceStr.has_value() && newTopBid.priceStr.has_value())
-                        {
-                            topPriceChanged = lastTopBid.priceStr.value() != newTopBid.priceStr.value();
-                        }
-                    }
-                    if (!topPriceChanged && !last.asks.empty() && !viewResult.asks.empty())
-                    {
-                        const auto &lastTopAsk = last.asks[0];
-                        const auto &newTopAsk = viewResult.asks[0];
-                        if (lastTopAsk.priceStr.has_value() && newTopAsk.priceStr.has_value())
-                        {
-                            topPriceChanged = lastTopAsk.priceStr.value() != newTopAsk.priceStr.value();
-                        }
-                    }
-
-                    // Compare maxCumulativeQuantityNum (only check if no price/item changes)
-                    bool maxCumulativeChanged = false;
-                    if (!itemsCountChanged && !topPriceChanged)
-                    {
-                        if (last.maxCumulativeQuantityNum.has_value() &&
-                            viewResult.maxCumulativeQuantityNum.has_value())
-                        {
-                            double diff = std::abs(
-                                last.maxCumulativeQuantityNum.value() -
-                                viewResult.maxCumulativeQuantityNum.value());
-                            // Threshold 0.1% - only check if no price/item changes
-                            maxCumulativeChanged = diff > (last.maxCumulativeQuantityNum.value() * 0.001);
-                        }
-                        else
-                        {
-                            maxCumulativeChanged = last.maxCumulativeQuantityNum != viewResult.maxCumulativeQuantityNum;
-                        }
-                    }
-
-                    // Queue if there are any changes
-                    shouldQueue = maxCumulativeChanged || itemsCountChanged || topPriceChanged;
-
-                    // Update throttle state if will queue
-                    if (shouldQueue)
-                    {
-                        callbackState.lastCallbackTime = now;
-                        // Copy (not move) to keep for next comparison
-                        callbackState.lastQueuedResult = viewResult;
-                    }
-                    else
-                    {
-                        // Don't update lastQueuedResult if not queueing (keep for comparison)
-                        return; // Drop update
-                    }
-                }
-            }
-        }
-
-        // Only queue if shouldQueue is true (determined by throttle/conditional logic above)
-        if (!shouldQueue)
-        {
-            return; // Should not reach here, but safety check
-        }
-
-        // Aggressive: only keep latest orderbook callback in queue
-        // Drop all old orderbook callbacks, only keep latest
+        // Queue callback with OrderBookMessageData - RN store will handle all processing
         {
             std::lock_guard<std::mutex> queueLock(callbackQueueMutex_);
 
-            // Drop old orderbook callbacks in queue
-            // Note: We can't easily identify orderbook callbacks without adding type field
-            // For now, use aggressive dropping: if queue is getting full, drop older ones
-            if (callbackQueue_.size() >= MAX_CALLBACK_QUEUE_SIZE)
+            // Estimate memory size (rough estimate: OrderBookMessageData can be large with bids/asks)
+            // Each OrderBookMessageData can contain 500+ bids/asks, estimate ~5KB per callback
+            size_t estimatedMemory = callbackQueue_.size() * 5120; // 5KB per callback estimate
+
+            // More aggressive dropping based on memory
+            if (estimatedMemory > MAX_CALLBACK_MEMORY_BYTES || callbackQueue_.size() >= MAX_CALLBACK_QUEUE_SIZE)
             {
-                // Drop half of queue to make room
-                size_t dropCount = MAX_CALLBACK_QUEUE_SIZE / 2;
+                // Drop more aggressively if memory limit exceeded
+                size_t dropCount = callbackQueue_.size() / 2; // Drop 50% by default
+                if (estimatedMemory > MAX_CALLBACK_MEMORY_BYTES * 2)
+                {
+                    dropCount = callbackQueue_.size() * 3 / 4; // Drop 75% if way over limit
+                }
+                // Also drop if queue size exceeds limit even slightly
+                if (callbackQueue_.size() > MAX_CALLBACK_QUEUE_SIZE)
+                {
+                    dropCount = std::max(dropCount, callbackQueue_.size() - MAX_CALLBACK_QUEUE_SIZE);
+                }
+
                 for (size_t i = 0; i < dropCount && !callbackQueue_.empty(); ++i)
                 {
                     callbackQueue_.pop();
                 }
             }
 
-            // Queue latest callback - use move to avoid copying large OrderBookViewResult
-            // Lambda captures viewResult by move to transfer ownership efficiently
-            // Note: viewResult is still valid here (not moved yet) because we copied it to lastQueuedResult
-            callbackQueue_.push(CallbackTask{[viewResult = std::move(viewResult), callback]()
+            // Move OrderBookMessageData into lambda to avoid copy (fixes memory leak)
+            callbackQueue_.push(CallbackTask{[orderBookData = std::move(orderBookData), callback]()
                                              {
                                                  try
                                                  {
-                                                     callback(viewResult);
+                                                     callback(orderBookData);
                                                  }
                                                  catch (const std::exception &e)
                                                  {
@@ -740,31 +435,102 @@ namespace margelo::nitro::cxpmobile_tpsdk
         }
     }
 
-    void TpSdkCppHybrid::queueTradeCallback(TradeMessageData tradeData, TpSdkCppHybrid *instance)
+    void TpSdkCppHybrid::queueTradeCallback(std::vector<TradeMessageData> batch, TpSdkCppHybrid *instance)
     {
         if (instance == nullptr)
+        {
+            std::cerr << "[TpSdkCppHybrid] queueTradeCallback: instance is null" << std::endl;
             return;
+        }
 
-        std::function<void(const TradeMessageData &)> callback;
+        std::function<void(const std::vector<TradeMessageData> &)> callback;
         {
             std::lock_guard<std::mutex> callbackLock(instance->tradesCallbackMutex_);
             if (!instance->tradesCallback_)
+            {
+                std::cerr << "[TpSdkCppHybrid] queueTradeCallback: callback not registered" << std::endl;
                 return;
+            }
             callback = instance->tradesCallback_;
         }
 
-        manageCallbackQueueSize(1);
+        // Queue callback with TradeMessageData batch - similar to orderbook pattern
         {
             std::lock_guard<std::mutex> queueLock(callbackQueueMutex_);
-            callbackQueue_.push(CallbackTask{[tradeData = std::move(tradeData), callback]()
+
+            // Estimate memory size (rough estimate: each TradeMessageData can contain multiple trades)
+            // Each TradeMessageData has ~8 strings, estimate ~1KB per TradeMessageData
+            size_t estimatedMemory = callbackQueue_.size() * 5120; // 5KB per callback estimate
+            size_t batchMemory = batch.size() * 1024;              // 1KB per trade in batch
+
+            // More aggressive dropping based on memory
+            if (estimatedMemory > MAX_CALLBACK_MEMORY_BYTES || callbackQueue_.size() >= MAX_CALLBACK_QUEUE_SIZE)
+            {
+                // Drop more aggressively if memory limit exceeded
+                size_t dropCount = callbackQueue_.size() / 2; // Drop 50% by default
+                if (estimatedMemory > MAX_CALLBACK_MEMORY_BYTES * 2)
+                {
+                    dropCount = callbackQueue_.size() * 3 / 4; // Drop 75% if way over limit
+                }
+                // Also drop if queue size exceeds limit even slightly
+                if (callbackQueue_.size() > MAX_CALLBACK_QUEUE_SIZE)
+                {
+                    dropCount = std::max(dropCount, callbackQueue_.size() - MAX_CALLBACK_QUEUE_SIZE);
+                }
+
+                for (size_t i = 0; i < dropCount && !callbackQueue_.empty(); ++i)
+                {
+                    callbackQueue_.pop();
+                }
+            }
+
+            // Move batch into lambda to avoid copy (similar to orderbook pattern)
+            callbackQueue_.push(CallbackTask{[batch = std::move(batch), callback]()
                                              {
                                                  try
                                                  {
-                                                     callback(tradeData);
+                                                     callback(batch);
                                                  }
                                                  catch (const std::exception &e)
                                                  {
-                                                     std::cerr << "[C++ ERROR] Trades callback exception: " << e.what() << std::endl;
+                                                     std::cerr << "[C++ ERROR] Trades batch callback exception: " << e.what() << std::endl;
+                                                 }
+                                             }});
+        }
+    }
+
+    void TpSdkCppHybrid::queueUserDataCallback(UserMessageData userData, TpSdkCppHybrid *instance)
+    {
+        if (instance == nullptr)
+        {
+            std::cerr << "[TpSdkCppHybrid] queueUserDataCallback: instance is null" << std::endl;
+            return;
+        }
+
+        std::function<void(const UserMessageData &)> callback;
+        {
+            std::lock_guard<std::mutex> callbackLock(instance->userDataCallbackMutex_);
+            if (!instance->userDataCallback_)
+            {
+                std::cerr << "[TpSdkCppHybrid] queueUserDataCallback: callback not registered" << std::endl;
+                return;
+            }
+            callback = instance->userDataCallback_;
+        }
+
+        // More aggressive queue management for userData
+        manageCallbackQueueSize(1);
+        {
+            std::lock_guard<std::mutex> queueLock(callbackQueueMutex_);
+            callbackQueue_.push(CallbackTask{[userData = std::move(userData), callback]()
+                                             {
+                                                 try
+                                                 {
+                                                     callback(userData);
+                                                 }
+                                                 catch (const std::exception &e)
+                                                 {
+                                                     std::cerr << "[C++ ERROR] UserData callback exception: " << e.what() << std::endl;
                                                  }
                                              }});
         }
@@ -772,8 +538,8 @@ namespace margelo::nitro::cxpmobile_tpsdk
 
     void TpSdkCppHybrid::processCallbackQueue()
     {
-        constexpr size_t MAX_CALLBACKS_PER_BATCH = 2; // Reduced from 5 to 2
-        constexpr size_t DROP_THRESHOLD = 5;          // Reduced from 15 to 5
+        constexpr size_t MAX_CALLBACKS_PER_BATCH = 1; // Reduced from 2 to 1 for lower memory
+        constexpr size_t DROP_THRESHOLD = 2;          // Reduced from 5 to 2 for more aggressive dropping
 
         std::vector<TpSdkCppHybrid::CallbackTask> callbacksToExecute;
         size_t queueSize = 0;
@@ -783,14 +549,14 @@ namespace margelo::nitro::cxpmobile_tpsdk
             queueSize = callbackQueue_.size();
 
             // More aggressive dropping for orderbook callbacks to prevent memory buildup
-            // OrderBookViewResult is large (100 items × 3 strings = 300 strings per result)
+            // OrderBookMessageData can be large (contains bids/asks arrays)
             if (queueSize > DROP_THRESHOLD)
             {
                 size_t dropCount = queueSize - DROP_THRESHOLD;
                 // Drop more aggressively if queue is very large
                 if (queueSize > DROP_THRESHOLD * 2)
                 {
-                    dropCount = queueSize - (DROP_THRESHOLD / 2);
+                    dropCount = queueSize - 1; // Keep only 1 item if way over threshold
                 }
                 for (size_t i = 0; i < dropCount && !callbackQueue_.empty(); ++i)
                 {
@@ -831,6 +597,51 @@ namespace margelo::nitro::cxpmobile_tpsdk
         LifecycleManager::clearOldInstanceData(oldInstance);
     }
 
+    void TpSdkCppHybrid::performPeriodicCleanup()
+    {
+        TpSdkCppHybrid *instance = getSingletonInstance();
+        if (instance == nullptr)
+        {
+            return;
+        }
+
+        try
+        {
+            // Clear stale pending trades
+            {
+                std::lock_guard<std::mutex> lock(instance->tradesState_.mutex);
+                instance->tradesState_.clearStalePendingTrades();
+                instance->tradesState_.optimizeMemory();
+            }
+
+            // OrderBook state is handled in RN store, no cleanup needed
+
+            // Optimize kline memory
+            {
+                std::lock_guard<std::mutex> lock(instance->klineState_.mutex);
+                instance->klineState_.trimToLimit();
+                instance->klineState_.optimizeMemory();
+            }
+
+            // Optimize allTickersData_ vector
+            {
+                std::lock_guard<std::mutex> lock(instance->allTickersMutex_);
+                if (instance->allTickersData_.capacity() > instance->allTickersData_.size() * 2 && instance->allTickersData_.size() > 0)
+                {
+                    instance->allTickersData_.shrink_to_fit();
+                }
+            }
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "[C++ ERROR] Exception in periodic cleanup: " << e.what() << std::endl;
+        }
+        catch (...)
+        {
+            std::cerr << "[C++ ERROR] Unknown exception in periodic cleanup" << std::endl;
+        }
+    }
+
     bool TpSdkCppHybrid::isInitialized()
     {
         return LifecycleManager::isInitialized(this);
@@ -857,147 +668,5 @@ namespace margelo::nitro::cxpmobile_tpsdk
         }
     }
 
-    void TpSdkCppHybrid::orderbookWorkerThreadFunction()
-    {
-        constexpr size_t MAX_BATCH_SIZE = 3;
-
-        while (orderbookWorkerRunning_)
-        {
-            std::vector<MessageTask> tasks;
-            tasks.reserve(MAX_BATCH_SIZE);
-
-            {
-                std::unique_lock<std::mutex> lock(orderbookQueueMutex_);
-                orderbookQueueCondition_.wait(lock, [&]
-                                              { return !orderbookQueue_.empty() || !orderbookWorkerRunning_; });
-
-                if (!orderbookWorkerRunning_ && orderbookQueue_.empty())
-                {
-                    break;
-                }
-
-                size_t batchSize = std::min(orderbookQueue_.size(), MAX_BATCH_SIZE);
-                for (size_t i = 0; i < batchSize && !orderbookQueue_.empty(); ++i)
-                {
-                    tasks.emplace_back(std::move(orderbookQueue_.front()));
-                    orderbookQueue_.pop();
-                }
-            }
-
-            for (auto &task : tasks)
-            {
-                processOrderbookMessage(task);
-            }
-        }
-    }
-
-    void TpSdkCppHybrid::lightweightWorkerThreadFunction()
-    {
-        constexpr size_t MAX_BATCH_SIZE = 20;
-
-        while (lightweightWorkerRunning_)
-        {
-            std::vector<MessageTask> tasks;
-            tasks.reserve(MAX_BATCH_SIZE);
-
-            {
-                std::unique_lock<std::mutex> lock(lightweightQueueMutex_);
-                lightweightQueueCondition_.wait(lock, [&]
-                                                { return !lightweightQueue_.empty() || !lightweightWorkerRunning_; });
-
-                if (!lightweightWorkerRunning_ && lightweightQueue_.empty())
-                {
-                    break;
-                }
-
-                size_t batchSize = std::min(lightweightQueue_.size(), MAX_BATCH_SIZE);
-                for (size_t i = 0; i < batchSize && !lightweightQueue_.empty(); ++i)
-                {
-                    tasks.emplace_back(std::move(lightweightQueue_.front()));
-                    lightweightQueue_.pop();
-                }
-            }
-
-            for (auto &task : tasks)
-            {
-                processLightweightMessage(task);
-            }
-        }
-    }
-
-    void TpSdkCppHybrid::orderbookConfigSetAggregation(const std::string &aggregationStr)
-    {
-        TpSdkCppHybrid *instance = getOrCreateSingletonInstance();
-        OrderBookManager::orderbookConfigSetAggregation(instance, aggregationStr);
-    }
-
-    // Override methods from HybridTpSdkSpec (with double parameters)
-    void TpSdkCppHybrid::orderbookConfigSetDecimals(std::optional<double> baseDecimals, std::optional<double> quoteDecimals)
-    {
-        std::optional<int> baseDecimalsInt = baseDecimals.has_value() ? std::optional<int>(static_cast<int>(*baseDecimals)) : std::nullopt;
-        std::optional<int> quoteDecimalsInt = quoteDecimals.has_value() ? std::optional<int>(static_cast<int>(*quoteDecimals)) : std::nullopt;
-        orderbookConfigSetDecimals(baseDecimalsInt, quoteDecimalsInt);
-    }
-
-    void TpSdkCppHybrid::orderbookDataSetSnapshot(
-        const std::vector<std::tuple<std::string, std::string>> &bids,
-        const std::vector<std::tuple<std::string, std::string>> &asks,
-        std::optional<double> baseDecimals,
-        std::optional<double> quoteDecimals)
-    {
-        std::optional<int> baseDecimalsInt = baseDecimals.has_value() ? std::optional<int>(static_cast<int>(*baseDecimals)) : std::nullopt;
-        std::optional<int> quoteDecimalsInt = quoteDecimals.has_value() ? std::optional<int>(static_cast<int>(*quoteDecimals)) : std::nullopt;
-        orderbookDataSetSnapshot(bids, asks, baseDecimalsInt, quoteDecimalsInt);
-    }
-
-    void TpSdkCppHybrid::tradesConfigSetDecimals(std::optional<double> priceDecimals, std::optional<double> quantityDecimals)
-    {
-        std::optional<int> priceDecimalsInt = priceDecimals.has_value() ? std::optional<int>(static_cast<int>(*priceDecimals)) : std::nullopt;
-        std::optional<int> quantityDecimalsInt = quantityDecimals.has_value() ? std::optional<int>(static_cast<int>(*quantityDecimals)) : std::nullopt;
-        tradesConfigSetDecimals(priceDecimalsInt, quantityDecimalsInt);
-    }
-
-    void TpSdkCppHybrid::tickerConfigSetDecimals(std::optional<double> priceDecimals)
-    {
-        std::optional<int> priceDecimalsInt = priceDecimals.has_value() ? std::optional<int>(static_cast<int>(*priceDecimals)) : std::nullopt;
-        tickerConfigSetDecimals(priceDecimalsInt);
-    }
-
-    // Public API methods (with int parameters)
-    void TpSdkCppHybrid::orderbookConfigSetDecimals(std::optional<int> baseDecimals, std::optional<int> quoteDecimals)
-    {
-        TpSdkCppHybrid *instance = getOrCreateSingletonInstance();
-        OrderBookManager::orderbookConfigSetDecimals(instance, baseDecimals, quoteDecimals);
-    }
-
-    void TpSdkCppHybrid::orderbookDataSetSnapshot(
-        const std::vector<std::tuple<std::string, std::string>> &bids,
-        const std::vector<std::tuple<std::string, std::string>> &asks)
-    {
-        // Call the int version explicitly to avoid ambiguity with double version
-        orderbookDataSetSnapshot(bids, asks, std::optional<int>{}, std::optional<int>{});
-    }
-
-    void TpSdkCppHybrid::orderbookDataSetSnapshot(
-        const std::vector<std::tuple<std::string, std::string>> &bids,
-        const std::vector<std::tuple<std::string, std::string>> &asks,
-        std::optional<int> baseDecimals,
-        std::optional<int> quoteDecimals)
-    {
-        TpSdkCppHybrid *instance = getOrCreateSingletonInstance();
-        OrderBookManager::orderbookDataSetSnapshot(instance, bids, asks, baseDecimals, quoteDecimals);
-    }
-
-    void TpSdkCppHybrid::tradesConfigSetDecimals(std::optional<int> priceDecimals, std::optional<int> quantityDecimals)
-    {
-        TpSdkCppHybrid *instance = getOrCreateSingletonInstance();
-        TradesManager::tradesConfigSetDecimals(instance, priceDecimals, quantityDecimals);
-    }
-
-    void TpSdkCppHybrid::tickerConfigSetDecimals(std::optional<int> priceDecimals)
-    {
-        TpSdkCppHybrid *instance = getOrCreateSingletonInstance();
-        TickerManager::tickerConfigSetDecimals(instance, priceDecimals);
-    }
-
+    // Old userData worker thread function removed - using optimized processors only
 } // namespace margelo::nitro::cxpmobile_tpsdk

@@ -17,8 +17,17 @@ namespace margelo::nitro::cxpmobile_tpsdk
         {
             if (instance != nullptr)
             {
+                // Clear callback first
+                {
                 std::lock_guard<std::mutex> lock(instance->miniTickerCallbackMutex_);
                 instance->miniTickerCallback_ = nullptr;
+                }
+                
+                // Clear ticker state when unsubscribing
+                {
+                    std::lock_guard<std::mutex> lock(instance->tickerState_.mutex);
+                    instance->tickerState_.data = TickerMessageData();
+                }
             }
         }
 
@@ -32,29 +41,20 @@ namespace margelo::nitro::cxpmobile_tpsdk
         {
             if (instance != nullptr)
             {
+                // Clear callback first
+            {
                 std::lock_guard<std::mutex> lock(instance->miniTickerPairCallbackMutex_);
                 instance->miniTickerPairCallback_ = nullptr;
+                }
+                
+                // Clear all tickers data when unsubscribing
+                {
+                    std::lock_guard<std::mutex> lock(instance->allTickersMutex_);
+                    instance->allTickersData_.clear();
+                    instance->allTickersData_.shrink_to_fit();
+                }
             }
         }
 
-        void tickerConfigSetDecimals(TpSdkCppHybrid *instance, std::optional<int> priceDecimals)
-        {
-            if (instance == nullptr)
-            {
-                return;
-            }
-
-            std::lock_guard<std::mutex> lock(instance->tickerState_.mutex);
-
-            if (priceDecimals.has_value())
-            {
-                int priceDec = priceDecimals.value();
-                if (priceDec < 0)
-                    priceDec = 0;
-                if (priceDec > 18)
-                    priceDec = 18;
-                instance->tickerState_.priceDecimals = priceDec;
-            }
-        }
     }
 }

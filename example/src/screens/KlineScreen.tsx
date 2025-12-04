@@ -1,25 +1,20 @@
-import React, { useCallback, useMemo, useEffect } from 'react';
-import {
-  StyleSheet,
-  View,
-  Text,
-  FlatList,
-  TouchableOpacity,
-} from 'react-native';
+import React, {
+  useCallback,
+  useMemo,
+  useEffect,
+  useRef,
+  useState,
+} from 'react';
+import { StyleSheet, View, Text, FlatList } from 'react-native';
 import { SafeAreaView, StatusBar } from 'react-native';
 import { TpSdk } from '@cxptek/tp-sdk';
 import { useTradingStore } from '../stores/useTradingStore';
 import type { KlineMessageData } from '@cxptek/tp-sdk';
-import { generateCxpId } from '../utils/cxpId';
+import { getKlineProperties } from '../types';
 
 interface KlineScreenProps {
-  ws: WebSocket | null;
-  processingStats: {
-    totalProcessed: number;
-    queueProcessed: number;
-    lastMessageType: string;
-    lastProcessTime: number;
-  };
+  binanceBaseUrl: string;
+  defaultSymbol: string;
 }
 
 // Move format functions outside component to avoid recreation on each render
@@ -63,46 +58,47 @@ const getPriceChangeColor = (open: string, close: string): string => {
 
 // Memoized Kline item component to prevent unnecessary re-renders
 const KlineItem = React.memo(({ item }: { item: KlineMessageData }) => {
+  const props = useMemo(() => getKlineProperties(item), [item]);
+
   // Pre-compute values once per item
   const priceColor = useMemo(
-    () => getPriceChangeColor(item.open, item.close),
-    [item.open, item.close]
+    () => getPriceChangeColor(props.open, props.close),
+    [props.open, props.close]
   );
 
-  const formattedOpen = useMemo(() => formatPrice(item.open), [item.open]);
-  const formattedHigh = useMemo(() => formatPrice(item.high), [item.high]);
-  const formattedLow = useMemo(() => formatPrice(item.low), [item.low]);
-  const formattedClose = useMemo(() => formatPrice(item.close), [item.close]);
+  const formattedOpen = useMemo(() => formatPrice(props.open), [props.open]);
+  const formattedHigh = useMemo(() => formatPrice(props.high), [props.high]);
+  const formattedLow = useMemo(() => formatPrice(props.low), [props.low]);
+  const formattedClose = useMemo(() => formatPrice(props.close), [props.close]);
   const formattedVolume = useMemo(
-    () => formatVolume(item.volume),
-    [item.volume]
+    () => formatVolume(props.volume),
+    [props.volume]
   );
   const formattedQuoteVolume = useMemo(
-    () => (item.quoteVolume ? formatVolume(item.quoteVolume) : null),
-    [item.quoteVolume]
+    () => (props.quoteVolume ? formatVolume(props.quoteVolume) : null),
+    [props.quoteVolume]
   );
   const formattedTimestamp = useMemo(
-    () => formatTimestamp(item.timestamp),
-    [item.timestamp]
+    () => formatTimestamp(props.timestamp),
+    [props.timestamp]
   );
   const formattedOpenTime = useMemo(
-    () => (item.openTime ? formatTimestamp(parseInt(item.openTime, 10)) : null),
-    [item.openTime]
+    () => (props.openTime ? formatTimestamp(props.openTime) : null),
+    [props.openTime]
   );
   const formattedCloseTime = useMemo(
-    () =>
-      item.closeTime ? formatTimestamp(parseInt(item.closeTime, 10)) : null,
-    [item.closeTime]
+    () => (props.closeTime ? formatTimestamp(props.closeTime) : null),
+    [props.closeTime]
   );
 
   return (
     <View style={styles.klineItem}>
       <View style={styles.klineHeader}>
         <View>
-          <Text style={styles.klineSymbol}>{item.symbol || 'N/A'}</Text>
+          <Text style={styles.klineSymbol}>{props.symbol || 'N/A'}</Text>
           <Text style={styles.klineInterval}>
-            {item.interval || 'N/A'} •{' '}
-            {item.isClosed === 'true' ? 'Closed' : 'Open'}
+            {props.interval || 'N/A'} •{' '}
+            {props.isClosed === 'true' ? 'Closed' : 'Open'}
           </Text>
         </View>
         <Text style={styles.klineTimestamp}>{formattedTimestamp}</Text>
@@ -151,10 +147,10 @@ const KlineItem = React.memo(({ item }: { item: KlineMessageData }) => {
           </View>
         )}
 
-        {item.trades && (
+        {props.trades && (
           <View style={styles.volumeColumn}>
             <Text style={styles.volumeLabel}>Trades</Text>
-            <Text style={styles.volumeValue}>{item.trades}</Text>
+            <Text style={styles.volumeValue}>{props.trades}</Text>
           </View>
         )}
       </View>
@@ -171,59 +167,124 @@ const KlineItem = React.memo(({ item }: { item: KlineMessageData }) => {
 
 KlineItem.displayName = 'KlineItem';
 
-export function KlineScreen({ ws }: KlineScreenProps) {
+export function KlineScreen({
+  binanceBaseUrl,
+  defaultSymbol,
+}: KlineScreenProps) {
   const klines = useTradingStore((state) => state.klines);
   const addKline = useTradingStore((state) => state.addKline);
+  const wsRef = useRef<WebSocket | null>(null);
+  const [isConnected, setIsConnected] = useState(false);
 
-  // Subscribe to kline WebSocket stream
+  // Auto-detect platform (Binance or CXP) from symbol format
+  const isCXP =
+    defaultSymbol.includes('_') &&
+    defaultSymbol === defaultSymbol.toUpperCase();
+  const platform = isCXP ? 'CXP' : 'Binance';
+
+  // WebSocket connection - supports both Binance and CXP
   useEffect(() => {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    console.log(
+      `[KlineScreen] Connecting to ${platform} WebSocket:`,
+      binanceBaseUrl
+    );
 
-    try {
-      // Subscribe to kline stream
-      const klineSubscribe = {
-        method: 'subscribe',
-        params: ['ETH_USDT@kline_1m'],
-        id: generateCxpId(),
-      };
-      ws.send(JSON.stringify(klineSubscribe));
-      console.log('[KlineScreen] Subscribed to ETH_USDT@kline_1m');
-    } catch (error) {
-      console.error('[KlineScreen] Error subscribing:', error);
-    }
-  }, [ws]);
+    const ws = new WebSocket(binanceBaseUrl);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      console.log(`[KlineScreen] ${platform} WebSocket connected`);
+      setIsConnected(true);
+
+      // Send SUBSCRIBE message for both Binance and CXP
+      // Binance: method="SUBSCRIBE", id=1 (number)
+      // CXP: method="subscribe", id="g8fur6z" (string)
+      const subscribeMessage = isCXP
+        ? {
+            method: 'subscribe',
+            params: [`${defaultSymbol}@kline_1m`],
+            id: `kline_${Date.now()}`,
+          }
+        : {
+            method: 'SUBSCRIBE',
+            params: [`${defaultSymbol}@kline_1m`],
+            id: 1,
+          };
+
+      ws.send(JSON.stringify(subscribeMessage));
+      console.log('[KlineScreen] Sent SUBSCRIBE:', subscribeMessage);
+    };
+
+    ws.onmessage = (event) => {
+      if (!event.data) {
+        return;
+      }
+
+      try {
+        // Check if it's a response to SUBSCRIBE (both Binance and CXP send confirmation)
+        if (typeof event.data === 'string') {
+          const data = JSON.parse(event.data);
+          // Binance: {result: null, id: 1}
+          // CXP: {result: null, id: "g8fur6z"} or similar
+          if (
+            data.result === null &&
+            (data.id === 1 || typeof data.id === 'string')
+          ) {
+            return; // SUBSCRIBE confirmation, ignore
+          }
+        }
+
+        // SDK will auto-detect and parse format (Binance or CXP)
+        TpSdk.parseMessage(event.data);
+      } catch (error) {
+        console.error('[KlineScreen] Error processing message:', error);
+      }
+    };
+
+    ws.onerror = (error) => {
+      console.error('[KlineScreen] WebSocket error:', error);
+      setIsConnected(false);
+    };
+
+    ws.onclose = (event) => {
+      console.log('[KlineScreen] WebSocket closed, code:', event.code);
+      setIsConnected(false);
+    };
+
+    return () => {
+      console.log('[KlineScreen] Cleaning up WebSocket');
+      if (
+        ws.readyState === WebSocket.OPEN ||
+        ws.readyState === WebSocket.CONNECTING
+      ) {
+        ws.close();
+      }
+      wsRef.current = null;
+      setIsConnected(false);
+    };
+  }, [binanceBaseUrl, defaultSymbol, isCXP, platform]);
 
   // Subscribe to kline updates
   useEffect(() => {
+    let subscriptionId: string | null = null;
     try {
-      TpSdk.kline.subscribe((data) => {
+      subscriptionId = TpSdk.kline.subscribe((data) => {
         addKline(data);
       });
-
-      return () => {
-        try {
-          TpSdk.kline.unsubscribe();
-        } catch {
-          // Ignore cleanup errors
-        }
-      };
     } catch {
       // Ignore initialization errors
     }
-  }, [addKline]);
 
-  // Function to send fake kline data
-  const sendFakeData = useCallback(() => {
-    try {
-      TpSdk.kline.sendFakeData({
-        symbol: 'ETH_USDT',
-        interval: '1m',
-        basePrice: 3000,
-      });
-    } catch (error) {
-      console.error('Error sending fake kline data:', error);
-    }
-  }, []);
+    return () => {
+      if (subscriptionId) {
+        try {
+          TpSdk.kline.unsubscribe(subscriptionId);
+        } catch {
+          // Ignore cleanup errors
+        }
+      }
+    };
+  }, [addKline]);
 
   // Memoize render function to prevent recreation on each render
   const renderKline = useCallback(
@@ -232,11 +293,12 @@ export function KlineScreen({ ws }: KlineScreenProps) {
   );
 
   // Memoize keyExtractor to prevent recreation
-  const keyExtractor = useCallback(
-    (item: KlineMessageData, index: number) =>
-      `${item.symbol}-${item.timestamp}-${item.interval}-${index}`,
-    []
-  );
+  const keyExtractor = useCallback((item: KlineMessageData, index: number) => {
+    const props = getKlineProperties(item);
+    return `${props.symbol}-${props.timestamp}-${props.interval}-${index}`;
+  }, []);
+
+  const symbolDisplay = defaultSymbol.toUpperCase().replace('USDT', '/USDT');
 
   return (
     <SafeAreaView style={styles.container}>
@@ -244,12 +306,14 @@ export function KlineScreen({ ws }: KlineScreenProps) {
 
       <View style={styles.topHeader}>
         <View style={styles.symbolContainer}>
-          <Text style={styles.symbolText}>ETH/USDT</Text>
+          <Text style={styles.symbolText}>{symbolDisplay}</Text>
           <Text style={styles.marketTypeText}>Kline (1m)</Text>
+          {isConnected ? (
+            <View style={styles.connectedIndicator} />
+          ) : (
+            <View style={styles.disconnectedIndicator} />
+          )}
         </View>
-        <TouchableOpacity style={styles.fakeButton} onPress={sendFakeData}>
-          <Text style={styles.fakeButtonText}>Fake Data</Text>
-        </TouchableOpacity>
       </View>
 
       <View style={styles.listHeader}>
@@ -270,7 +334,7 @@ export function KlineScreen({ ws }: KlineScreenProps) {
           <View style={styles.emptyContainer}>
             <Text style={styles.emptyText}>No kline data yet...</Text>
             <Text style={styles.emptySubtext}>
-              Waiting for ETH_USDT@kline_1m stream
+              Waiting for {defaultSymbol}@kline_1m stream
             </Text>
           </View>
         }
@@ -315,14 +379,17 @@ const styles = StyleSheet.create({
     borderRadius: 3,
     textTransform: 'uppercase',
   },
-  statsContainer: {
-    flexDirection: 'row',
-    gap: 12,
+  connectedIndicator: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#0ecb81',
   },
-  statsText: {
-    color: '#848e9c',
-    fontSize: 10,
-    fontFamily: 'monospace',
+  disconnectedIndicator: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#f6465d',
   },
   listHeader: {
     paddingHorizontal: 16,
@@ -450,16 +517,5 @@ const styles = StyleSheet.create({
     color: '#5a5f6a',
     fontSize: 12,
     fontStyle: 'italic',
-  },
-  fakeButton: {
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    backgroundColor: '#f6465d',
-    borderRadius: 4,
-  },
-  fakeButtonText: {
-    color: '#ffffff',
-    fontSize: 12,
-    fontWeight: '600',
   },
 });

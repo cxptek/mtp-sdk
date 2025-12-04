@@ -1,26 +1,21 @@
 #pragma once
 
-#include "json.hpp"
+#include "simdjson.h"
 #include <string>
 #include <vector>
-
-// Forward declaration
-namespace margelo::nitro::cxpmobile_tpsdk
-{
-    struct OrderBookLevel;
-}
+#include <tuple>
 
 namespace margelo::nitro::cxpmobile_tpsdk
 {
-    // JSON parsing helper functions using nlohmann/json
+    // JSON parsing helper functions using simdjson
     namespace JsonHelpers
     {
         // Safe JSON access helpers with defaults
-        std::string getJsonString(const nlohmann::json& j, const std::string& key, const std::string& defaultVal = "");
-        double getJsonDouble(const nlohmann::json& j, const std::string& key, double defaultVal = 0.0);
-        int64_t getJsonInt64(const nlohmann::json& j, const std::string& key, int64_t defaultVal = 0);
-        bool getJsonBool(const nlohmann::json& j, const std::string& key, bool defaultVal = false);
-        bool parsePriceQuantityArrayFromJson(const nlohmann::json& j, std::vector<OrderBookLevel>& levels);
+        std::string getJsonString(simdjson::ondemand::value &j, const std::string &key, const std::string &defaultVal = "");
+        double getJsonDouble(simdjson::ondemand::value &j, const std::string &key, double defaultVal = 0.0);
+        int64_t getJsonInt64(simdjson::ondemand::value &j, const std::string &key, int64_t defaultVal = 0);
+        bool getJsonBool(simdjson::ondemand::value &j, const std::string &key, bool defaultVal = false);
+        // Extract raw string arrays from JSON (keep as strings, don't parse to numbers)
+        bool extractRawStringArrayFromJson(simdjson::ondemand::value &j, std::vector<std::tuple<std::string, std::string>> &levels);
     }
 } // namespace margelo::nitro::cxpmobile_tpsdk
-

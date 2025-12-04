@@ -1,4 +1,4 @@
-import type { OrderBookViewResult } from '@cxptek/tp-sdk';
+import type { OrderBookViewResult } from '../types';
 import React, { useMemo } from 'react';
 import { Dimensions, StyleSheet, Text, View } from 'react-native';
 

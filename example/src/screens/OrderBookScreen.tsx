@@ -8,222 +8,216 @@ import {
   TouchableOpacity,
 } from 'react-native';
 import { TpSdk } from '@cxptek/tp-sdk';
-import type { OrderBookViewResult } from '@cxptek/tp-sdk';
+import type { OrderBookMessageData } from '@cxptek/tp-sdk';
 import { OrderBookAnimated } from '../components/OrderBookAnimated';
 import { useTradingStore } from '../stores/useTradingStore';
-import { generateCxpId } from '../utils/cxpId';
+import type { OrderBookViewResult } from '../types';
+import { runOnUISync, runOnJS } from 'react-native-worklets';
 
 interface OrderBookScreenProps {
-  ws: WebSocket | null;
+  binanceBaseUrl: string;
+  defaultSymbol: string;
 }
 
 const AGGREGATION_OPTIONS = ['0.01', '0.1', '1', '10', '100'];
-const DEFAULT_SYMBOL = 'ETH_USDT';
-// ETH_USDT decimals: base (ETH) = 8, quote (USDT) = 2
-const ETH_USDT_DECIMALS = { base: 8, quote: 2 };
 
-export function OrderBookScreen({ ws }: OrderBookScreenProps) {
+export function OrderBookScreen({
+  binanceBaseUrl,
+  defaultSymbol,
+}: OrderBookScreenProps) {
   const displayData = useTradingStore((state) => state.orderBook);
   const setOrderBook = useTradingStore((state) => state.setOrderBook);
   const [aggregation, setAggregation] = useState('0.01');
   const subscriptionIdRef = useRef<string | null>(null);
-  const [useFakeStream, setUseFakeStream] = useState(true); // Enable fake stream by default
-  const fakeStreamIntervalRef = useRef<ReturnType<typeof setInterval> | null>(
-    null
-  );
-  const fakeStreamBasePriceRef = useRef<number>(3000);
-  const fakeStreamPriceDirectionRef = useRef<number>(1); // 1 for up, -1 for down
+  const wsRef = useRef<WebSocket | null>(null);
+  const [isConnected, setIsConnected] = useState(false);
 
-  // Fake stream function to generate and send fake depth data
-  const sendFakeDepthUpdate = useCallback(() => {
-    const basePrice = fakeStreamBasePriceRef.current;
-    const numLevels = 20;
-    const priceStep = 0.5;
+  // Auto-detect platform (Binance or CXP) from symbol format
+  const isCXP =
+    defaultSymbol.includes('_') &&
+    defaultSymbol === defaultSymbol.toUpperCase();
 
-    // Generate fake bids and asks with slight price movement
-    const bids: [string, string][] = [];
-    const asks: [string, string][] = [];
-
-    for (let i = 1; i <= numLevels; i++) {
-      const bidPrice = (basePrice - i * priceStep).toFixed(2);
-      const askPrice = (basePrice + i * priceStep).toFixed(2);
-      // Random quantity with some variation
-      const quantity = (Math.random() * 10 + 1).toFixed(8);
-
-      bids.push([bidPrice, quantity]);
-      asks.push([askPrice, quantity]);
-    }
-
-    // Create fake depth update message in CXP format
-    const timestamp = Date.now();
-    const fakeMessage = JSON.stringify({
-      stream: `${DEFAULT_SYMBOL}@depth`,
-      data: {
-        e: 'depthUpdate',
-        E: timestamp,
-        s: DEFAULT_SYMBOL,
-        U: '1',
-        u: '2',
-        b: bids,
-        a: asks,
-      },
-    });
-
-    // Process message through SDK - automatically triggers callbacks
-    TpSdk.parseMessage(fakeMessage);
-
-    // Update base price with slight movement (simulate market movement)
-    const priceChange = (Math.random() - 0.5) * 2; // -1 to +1
-    fakeStreamBasePriceRef.current += priceChange;
-
-    // Reverse direction if price moves too far
-    if (fakeStreamBasePriceRef.current > 3100) {
-      fakeStreamPriceDirectionRef.current = -1;
-    } else if (fakeStreamBasePriceRef.current < 2900) {
-      fakeStreamPriceDirectionRef.current = 1;
-    }
-  }, []);
-
-  // Fake stream interval
+  // WebSocket connection - supports both Binance and CXP
+  // Binance: Uses Combined Streams API with SUBSCRIBE message
+  // CXP: Direct stream connection (no SUBSCRIBE needed)
   useEffect(() => {
-    if (!useFakeStream) {
-      // Clear interval if fake stream is disabled
-      if (fakeStreamIntervalRef.current) {
-        clearInterval(fakeStreamIntervalRef.current);
-        fakeStreamIntervalRef.current = null;
-      }
-      return;
-    }
+    const ws = new WebSocket(binanceBaseUrl);
+    wsRef.current = ws;
 
-    // Start fake stream - send updates every 100ms (10 updates per second)
-    fakeStreamIntervalRef.current = setInterval(() => {
-      sendFakeDepthUpdate();
-    }, 100);
+    ws.onopen = () => {
+      setIsConnected(true);
 
-    console.log('[OrderBookScreen] Fake depth stream started');
+      // Send SUBSCRIBE message for both Binance and CXP
+      // Binance: method="SUBSCRIBE", id=1 (number)
+      // CXP: method="subscribe", id="g8fur6z" (string)
+      const subscribeMessage = isCXP
+        ? {
+            method: 'subscribe',
+            params: [`${defaultSymbol}@depth`],
+            id: `orderbook_${Date.now()}`,
+          }
+        : {
+            method: 'SUBSCRIBE',
+            params: [`${defaultSymbol}@depth20@100ms`],
+            id: 1,
+          };
 
-    return () => {
-      if (fakeStreamIntervalRef.current) {
-        clearInterval(fakeStreamIntervalRef.current);
-        fakeStreamIntervalRef.current = null;
-        console.log('[OrderBookScreen] Fake depth stream stopped');
-      }
-    };
-  }, [useFakeStream, sendFakeDepthUpdate]);
-
-  // Subscribe to WebSocket depth stream and handle messages (only if not using fake stream)
-  useEffect(() => {
-    if (useFakeStream || !ws) {
-      return;
-    }
-
-    // Wait for WebSocket to be open before subscribing
-    const subscribeToDepth = () => {
-      if (ws.readyState !== WebSocket.OPEN) {
-        return;
-      }
+      console.log('subscribeMessage', subscribeMessage);
 
       try {
-        const subscribeMessage = {
-          method: 'subscribe',
-          params: [`${DEFAULT_SYMBOL}@depth`],
-          id: generateCxpId(),
-        };
         ws.send(JSON.stringify(subscribeMessage));
-        console.log(`[OrderBookScreen] Subscribed to ${DEFAULT_SYMBOL}@depth`);
       } catch (error) {
-        console.error(
-          '[OrderBookScreen] Error subscribing to WebSocket:',
-          error
-        );
+        console.error('[OrderBookScreen] Error sending SUBSCRIBE:', error);
       }
     };
 
-    // Subscribe when WebSocket opens
-    const handleOpen = () => {
-      subscribeToDepth();
-    };
-
-    // Handle WebSocket messages - process through SDK
-    const handleMessage = (event: { data?: string }) => {
+    ws.onmessage = (event) => {
       if (!event.data) {
         return;
       }
+      console.log('event', event.data);
 
-      // Process message through SDK - automatically triggers callbacks
-      TpSdk.parseMessage(event.data);
-    };
-
-    // Set up event handlers
-    if (ws.readyState === WebSocket.OPEN) {
-      subscribeToDepth();
-    } else {
-      ws.addEventListener('open', handleOpen);
-    }
-
-    ws.addEventListener('message', handleMessage);
-
-    return () => {
-      ws.removeEventListener('open', handleOpen);
-      ws.removeEventListener('message', handleMessage);
-    };
-  }, [ws, useFakeStream]);
-
-  // Initialize SDK if not already initialized
-  useEffect(() => {
-    const initSdk = async () => {
       try {
-        // Check if SDK is already initialized
-        if (TpSdk.isInitialized?.()) {
-          return;
+        // Check if it's a response to SUBSCRIBE (both Binance and CXP send confirmation)
+        if (typeof event.data === 'string') {
+          const data = JSON.parse(event.data);
+          // Binance: {result: null, id: 1}
+          // CXP: {result: null, id: "g8fur6z"} or similar
+          if (
+            data.result === null &&
+            (data.id === 1 || typeof data.id === 'string')
+          ) {
+            return; // SUBSCRIBE confirmation, ignore
+          }
         }
 
-        // Initialize SDK
-        TpSdk.init((response) => {
-          if (response === 'success') {
-            console.log('[OrderBookScreen] SDK initialized');
-          } else {
-            console.error('[OrderBookScreen] SDK initialization failed');
-          }
-        });
+        // SDK will auto-detect and parse format (Binance or CXP)
+        TpSdk.parseMessage(event.data);
       } catch (error) {
-        console.error('[OrderBookScreen] Error initializing SDK:', error);
+        console.error('[OrderBookScreen] Error processing message:', error);
       }
     };
 
-    initSdk();
-  }, []);
+    ws.onerror = () => {
+      setIsConnected(false);
+    };
+
+    ws.onclose = () => {
+      setIsConnected(false);
+    };
+
+    return () => {
+      if (
+        ws.readyState === WebSocket.OPEN ||
+        ws.readyState === WebSocket.CONNECTING
+      ) {
+        ws.close();
+      }
+      wsRef.current = null;
+      setIsConnected(false);
+    };
+  }, [binanceBaseUrl, defaultSymbol, isCXP]);
 
   // Subscribe to orderbook updates from SDK
   useEffect(() => {
     // Wait for SDK to be initialized
     if (!TpSdk.isInitialized?.()) {
-      console.log('[OrderBookScreen] Waiting for SDK initialization...');
       return;
     }
 
     let subscriptionId: string | null = null;
 
     try {
-      const orderbookCallback = (data: OrderBookViewResult) => {
-        console.log(
-          '[OrderBookScreen] Callback received, bids=',
-          data.bids.length,
-          'asks=',
-          data.asks.length
-        );
-        setOrderBook(data);
+      const orderbookCallback = (data: OrderBookMessageData) => {
+        // Move heavy calculations (parseFloat, cumulative sums) to UI thread
+        runOnUISync(() => {
+          'worklet';
+          // Calculate cumulative quantities for animation background
+          let bidCumulative = 0;
+          let askCumulative = 0;
+          const maxBidCumulative: number[] = [];
+          const maxAskCumulative: number[] = [];
+
+          const bidsRaw = data.data.bids;
+          const asksRaw = data.data.asks;
+
+          // Process bids - calculate cumulative on UI thread
+          const bids: Array<{
+            priceStr: string;
+            amountStr: string;
+            cumulativeQuantity: string;
+          }> = [];
+          for (let i = 0; i < bidsRaw.length; i++) {
+            const bid = bidsRaw[i];
+            if (!bid) continue;
+            const [price, quantity] = bid;
+            const qty = parseFloat(quantity) || 0;
+            bidCumulative += qty;
+            maxBidCumulative.push(bidCumulative);
+            bids.push({
+              priceStr: price,
+              amountStr: quantity,
+              cumulativeQuantity: bidCumulative.toString(),
+            });
+          }
+
+          // Process asks - calculate cumulative on UI thread
+          const asks: Array<{
+            priceStr: string;
+            amountStr: string;
+            cumulativeQuantity: string;
+          }> = [];
+          for (let i = 0; i < asksRaw.length; i++) {
+            const ask = asksRaw[i];
+            if (!ask) continue;
+            const [price, quantity] = ask;
+            const qty = parseFloat(quantity) || 0;
+            askCumulative += qty;
+            maxAskCumulative.push(askCumulative);
+            asks.push({
+              priceStr: price,
+              amountStr: quantity,
+              cumulativeQuantity: askCumulative.toString(),
+            });
+          }
+
+          // Find max cumulative quantity for animation scaling
+          let maxBid = 0;
+          for (let i = 0; i < maxBidCumulative.length; i++) {
+            const val = maxBidCumulative[i];
+            if (val !== undefined && val > maxBid) {
+              maxBid = val;
+            }
+          }
+
+          let maxAsk = 0;
+          for (let i = 0; i < maxAskCumulative.length; i++) {
+            const val = maxAskCumulative[i];
+            if (val !== undefined && val > maxAsk) {
+              maxAsk = val;
+            }
+          }
+
+          const maxCumulative = maxBid > maxAsk ? maxBid : maxAsk;
+
+          // Build result object
+          const converted: OrderBookViewResult = {
+            bids,
+            asks,
+            symbol: data.data.symbol,
+            maxCumulativeQuantity:
+              maxCumulative > 0 ? maxCumulative.toString() : undefined,
+          };
+
+          // Call setOrderBook on JS thread
+          runOnJS(setOrderBook)(converted);
+        });
       };
 
-      // Subscribe with aggregation and decimals options
-      subscriptionId = TpSdk.orderbook.subscribe(orderbookCallback, {
-        aggregation: aggregation,
-        decimals: ETH_USDT_DECIMALS,
-      });
+      // Subscribe to orderbook updates
+      subscriptionId = TpSdk.orderbook.subscribe(orderbookCallback);
 
       subscriptionIdRef.current = subscriptionId;
-
-      console.log('[OrderBookScreen] Subscribed to orderbook updates');
     } catch (error) {
       console.error('[OrderBookScreen] Error subscribing to orderbook:', error);
     }
@@ -233,7 +227,6 @@ export function OrderBookScreen({ ws }: OrderBookScreenProps) {
         try {
           TpSdk.orderbook.unsubscribe(subscriptionId);
           subscriptionIdRef.current = null;
-          console.log('[OrderBookScreen] Unsubscribed from orderbook');
         } catch (error) {
           console.error('[OrderBookScreen] Error unsubscribing:', error);
         }
@@ -247,84 +240,18 @@ export function OrderBookScreen({ ws }: OrderBookScreenProps) {
       if (newAggregation === aggregation) {
         return;
       }
-
-      try {
-        // Update aggregation directly - C++ will trigger callback automatically
-        TpSdk.orderbook.setAggregation(newAggregation);
-        // Update state to reflect UI change
-        setAggregation(newAggregation);
-      } catch (error) {
-        console.error('[OrderBookScreen] Error changing aggregation:', error);
-      }
+      // Update state - aggregation will be handled in UI if needed
+      setAggregation(newAggregation);
     },
     [aggregation]
   );
 
-  // Send fake snapshot data for testing
-  const handleSendFakeSnapshot = useCallback(() => {
-    try {
-      const basePrice = 3000;
-      const numLevels = 20;
-      const priceStep = 0.5;
-
-      // Generate fake bids and asks
-      const bids: [string, string][] = [];
-      const asks: [string, string][] = [];
-
-      for (let i = 1; i <= numLevels; i++) {
-        const bidPrice = (basePrice - i * priceStep).toFixed(2);
-        const askPrice = (basePrice + i * priceStep).toFixed(2);
-        const quantity = (Math.random() * 10 + 1).toFixed(8);
-
-        bids.push([bidPrice, quantity]);
-        asks.push([askPrice, quantity]);
-      }
-
-      // Unsubscribe first
-      if (subscriptionIdRef.current) {
-        TpSdk.orderbook.unsubscribe(subscriptionIdRef.current);
-      }
-
-      // Re-subscribe with snapshot data
-      const orderbookCallback = (data: OrderBookViewResult) => {
-        console.log(
-          '[OrderBookScreen] Callback received, bids=',
-          data.bids.length,
-          'asks=',
-          data.asks.length
-        );
-        setOrderBook(data);
-      };
-
-      subscriptionIdRef.current = TpSdk.orderbook.subscribe(orderbookCallback, {
-        aggregation: aggregation,
-        decimals: ETH_USDT_DECIMALS,
-        snapshot: { bids, asks },
-      });
-
-      console.log('[OrderBookScreen] Sent fake snapshot data');
-    } catch (error) {
-      console.error('[OrderBookScreen] Error sending fake snapshot:', error);
-    }
-  }, [aggregation, setOrderBook]);
-
   // Reset orderbook
   const handleReset = useCallback(() => {
-    try {
-      TpSdk.orderbook.reset();
-      setOrderBook(null);
-      // Reset fake stream base price
-      fakeStreamBasePriceRef.current = 3000;
-      console.log('[OrderBookScreen] Reset orderbook');
-    } catch (error) {
-      console.error('[OrderBookScreen] Error resetting orderbook:', error);
-    }
+    setOrderBook(null as any); // Allow null for reset
   }, [setOrderBook]);
 
-  // Toggle fake stream
-  const handleToggleFakeStream = useCallback(() => {
-    setUseFakeStream((prev) => !prev);
-  }, []);
+  const symbolDisplay = defaultSymbol.toUpperCase().replace('USDT', '/USDT');
 
   return (
     <SafeAreaView style={styles.container}>
@@ -333,10 +260,13 @@ export function OrderBookScreen({ ws }: OrderBookScreenProps) {
       {/* Header */}
       <View style={styles.header}>
         <View style={styles.symbolContainer}>
-          <Text style={styles.symbolText}>
-            {DEFAULT_SYMBOL.replace('_', '/')}
-          </Text>
+          <Text style={styles.symbolText}>{symbolDisplay}</Text>
           <Text style={styles.marketTypeText}>Spot</Text>
+          {isConnected ? (
+            <View style={styles.connectedIndicator} />
+          ) : (
+            <View style={styles.disconnectedIndicator} />
+          )}
         </View>
         <View style={styles.headerButtons}>
           <TouchableOpacity
@@ -344,25 +274,6 @@ export function OrderBookScreen({ ws }: OrderBookScreenProps) {
             onPress={handleReset}
           >
             <Text style={styles.headerButtonText}>Reset</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={[
-              styles.headerButton,
-              useFakeStream
-                ? styles.fakeStreamActiveButton
-                : styles.fakeStreamButton,
-            ]}
-            onPress={handleToggleFakeStream}
-          >
-            <Text style={styles.headerButtonText}>
-              {useFakeStream ? 'Fake Stream ON' : 'Fake Stream OFF'}
-            </Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={[styles.headerButton, styles.fakeButton]}
-            onPress={handleSendFakeSnapshot}
-          >
-            <Text style={styles.headerButtonText}>Fake Snapshot</Text>
           </TouchableOpacity>
         </View>
       </View>
@@ -435,6 +346,18 @@ const styles = StyleSheet.create({
     borderRadius: 3,
     textTransform: 'uppercase',
   },
+  connectedIndicator: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#0ecb81',
+  },
+  disconnectedIndicator: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#f6465d',
+  },
   headerButtons: {
     flexDirection: 'row',
     gap: 8,
@@ -446,15 +369,6 @@ const styles = StyleSheet.create({
   },
   resetButton: {
     backgroundColor: '#2a2e39',
-  },
-  fakeButton: {
-    backgroundColor: '#f6465d',
-  },
-  fakeStreamButton: {
-    backgroundColor: '#2a2e39',
-  },
-  fakeStreamActiveButton: {
-    backgroundColor: '#0ecb81',
   },
   headerButtonText: {
     color: '#ffffff',

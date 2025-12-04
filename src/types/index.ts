@@ -1,75 +1,23 @@
-/**
- * Types Index
- *
- * Central export point for all type definitions
- */
-
-// ============================================================================
-// Order Book Types
-// ============================================================================
-
-export interface OrderBookLevel {
-  price: number;
-  quantity: number;
-}
-
-export interface OrderBookViewItem {
-  priceStr: string | null;
-  amountStr: string | null;
-  cumulativeQuantity: string | null;
-  cumulativeQuantityNum?: number;
-  normalizedPercentage?: number;
-}
-
-export interface OrderBookViewResult {
-  bids: OrderBookViewItem[];
-  asks: OrderBookViewItem[];
-  maxCumulativeQuantity: string;
-  maxCumulativeQuantityNum?: number;
-  maxCumulativeInv?: number;
-}
-
-export interface UpsertOrderBookResult {
-  bids: OrderBookLevel[];
-  asks: OrderBookLevel[];
-}
-
-// Socket data types (from websocket)
-export type DepthLevel = [string, string]; // [price, quantity]
-
-// API OrderBook format (from REST API)
-export interface SocketOrderBook {
-  bids: DepthLevel[]; // sorted desc by price
-  asks: DepthLevel[]; // sorted asc by price
-  ts: number;
-  wsTime?: number;
-}
-
-// WebSocket DepthData format (from CXP WebSocket)
 export interface DepthData {
-  e: 'depthUpdate';
-  E: number; // Event time
-  s: string; // Symbol, e.g., "ETH_USDT"
-  U: string; // First update ID
-  u: string; // Final update ID
-  b: [string, string][]; // Bids: [price, quantity][]
-  a: [string, string][]; // Asks: [price, quantity][]
-  dsTime: number; // WebSocket time
+  eventType: string;
+  eventTime: number;
+  symbol: string;
+  firstUpdateId: string;
+  finalUpdateId: string;
+  bids: [string, string][];
+  asks: [string, string][];
+  dsTime: number;
 }
 
-// ============================================================================
-// User Data Types (from userData WebSocket stream)
-// ============================================================================
-
-/**
- * User Data Types (from userData WebSocket stream)
- *
- * These types represent data structures received from the userData stream,
- * including order updates.
- */
-
-// User Message Data (with 'any' fields for TypeScript usage)
 export interface UserMessageData {
+  stream: string; // "userData"
+  wsTime: number; // WebSocket timestamp
+  data: UserDataItem; // User data item
+}
+
+export interface UserDataItem {
+  eventType: string;
+  eventTime: number;
   id?: string;
   userId?: string;
   symbolCode?: string;
@@ -88,158 +36,179 @@ export interface UserMessageData {
   avrPrice?: string;
   isCancelAll?: boolean;
   canceledBy?: string;
-  createdAt?: string;
-  updatedAt?: string;
-  submittedAt?: string;
-  dsTime?: string;
+  createdAt?: number;
+  updatedAt?: number;
+  submittedAt?: number;
+  dsTime?: number;
   triggerPrice?: string;
   conditionalOrderType?: string;
   timeInForce?: string;
   triggerStatus?: string;
-  triggerDirection?: string | number;
+  triggerDirection?: number;
   placeOrderReason?: string;
   contingencyType?: string;
   refId?: string;
   reduceVolume?: string;
   rejectedVolume?: string;
   rejectedBudget?: string;
-  e?: string;
-  E?: string;
-  eventType?: string;
-  event?: string;
-  stream?: string;
 }
 
-// ============================================================================
-// WebSocket Message Types
-// ============================================================================
+export interface OrderBookMessageData {
+  data: OrderBookDataItem;
+  wsTime: number; // WebSocket timestamp
+  stream: string; // Stream name, e.g., "ETH_USDT@depth"
+}
 
-/**
- * WebSocket Message Types
- *
- * Types for WebSocket message processing, including message types,
- * message results, and protocol data.
- */
+export interface OrderBookDataItem {
+  eventType: string;
+  eventTime: number;
+  symbol: string;
+  firstUpdateId: string;
+  finalUpdateId: string;
+  bids: [string, string][];
+  asks: [string, string][];
+  dsTime: number;
+}
 
-// Trade Side Type (extracted for Nitro compatibility)
 export type TradeSide = 'buy' | 'sell';
 
-// WebSocket Message Types
-// Note: Using numeric enum for Nitro C++ compatibility
-export enum WebSocketMessageType {
-  ORDER_BOOK_UPDATE = 0,
-  ORDER_BOOK_SNAPSHOT = 1,
-  TRADE = 2,
-  TICKER = 3,
-  KLINE = 4,
-  USER_ORDER_UPDATE = 5,
-  USER_TRADE_UPDATE = 6,
-  USER_ACCOUNT_UPDATE = 7,
-  PROTOCOL_LOGIN = 8,
-  PROTOCOL_SUBSCRIBE = 9,
-  PROTOCOL_UNSUBSCRIBE = 10,
-  PROTOCOL_ERROR = 11,
-  UNKNOWN = 12,
-}
-
-// Helper to get string representation of message type (for logging/debugging)
-export const WebSocketMessageTypeString: Record<WebSocketMessageType, string> =
-  {
-    [WebSocketMessageType.ORDER_BOOK_UPDATE]: 'orderBookUpdate',
-    [WebSocketMessageType.ORDER_BOOK_SNAPSHOT]: 'orderBookSnapshot',
-    [WebSocketMessageType.TRADE]: 'trade',
-    [WebSocketMessageType.TICKER]: 'ticker',
-    [WebSocketMessageType.KLINE]: 'kline',
-    [WebSocketMessageType.USER_ORDER_UPDATE]: 'userOrderUpdate',
-    [WebSocketMessageType.USER_TRADE_UPDATE]: 'userTradeUpdate',
-    [WebSocketMessageType.USER_ACCOUNT_UPDATE]: 'userAccountUpdate',
-    [WebSocketMessageType.PROTOCOL_LOGIN]: 'protocolLogin',
-    [WebSocketMessageType.PROTOCOL_SUBSCRIBE]: 'protocolSubscribe',
-    [WebSocketMessageType.PROTOCOL_UNSUBSCRIBE]: 'protocolUnsubscribe',
-    [WebSocketMessageType.PROTOCOL_ERROR]: 'protocolError',
-    [WebSocketMessageType.UNKNOWN]: 'unknown',
-  };
-
-// Order Book Message Data
-export interface OrderBookMessageData {
-  symbol: string;
-  bids: OrderBookLevel[];
-  asks: OrderBookLevel[];
-  timestamp?: number;
-  isSnapshot: boolean; // true for snapshot, false for update
-  // CXP specific fields
-  dsTime?: number; // CXP depth update timestamp
-  U?: string; // First update ID
-  u?: string; // Last update ID
-  // For merging with previous state
-  mergedResult?: UpsertOrderBookResult; // Only if previous state provided
-}
-
-// Trade Message Data
 export interface TradeMessageData {
+  stream: string; // e.g., "ETH_USDT@trade"
+  wsTime: number; // WebSocket timestamp
+  dsTime: number; // Data source timestamp
+  data: TradeDataItem[]; // Array of trade items
+}
+
+export interface TradeDataItem {
+  eventType: string;
+  eventTime: number;
   symbol: string;
+  tradeId: string;
   price: string;
   quantity: string;
-  side: TradeSide;
-  timestamp: number;
-  tradeId?: string;
+  tradeTime: number;
+  isBuyerMaker: boolean;
 }
 
-// Ticker Message Data
 export interface TickerMessageData {
+  data: TickerDataItem;
+  wsTime: number; // WebSocket timestamp
+  stream: string; // e.g., "ETH_USDT@miniTicker"
+}
+
+export interface TickerDataItem {
+  eventType: string;
+  eventTime: number;
   symbol: string;
-  currentPrice: string;
+  closePrice: string;
   openPrice: string;
   highPrice: string;
   lowPrice: string;
   volume: string;
   quoteVolume: string;
-  priceChange: string;
-  priceChangePercent: string;
-  timestamp: number;
+  dsTime: number;
 }
 
-// Kline Message Data
+export interface AllTickerMessageData {
+  stream: string; // "!miniTicker@arr"
+  data: AllTickerItem[]; // Array of ticker items
+}
+
+export interface AllTickerItem {
+  data: TickerDataItem;
+  wsTime: number; // WebSocket timestamp
+  stream: string; // e.g., "ETH_USDT@miniTicker"
+}
+
 export interface KlineMessageData {
+  data: KlineDataWrapper;
+  wsTime: number; // WebSocket timestamp
+  stream: string; // e.g., "ETH_USDT@kline_1s"
+}
+
+export interface KlineDataWrapper {
+  kline: KlineDataItem;
+  eventType: string;
+  eventTime: number;
+  symbol: string;
+  dsTime: number;
+}
+
+export interface KlineDataItem {
+  openTime: number;
+  closeTime: number;
   symbol: string;
   interval: string;
-  open: string;
-  high: string;
-  low: string;
-  close: string;
+  firstTradeId: string;
+  lastTradeId: string;
+  openPrice: string;
+  closePrice: string;
+  highPrice: string;
+  lowPrice: string;
   volume: string;
-  quoteVolume?: string;
-  trades?: string;
-  openTime?: string;
-  closeTime?: string;
-  isClosed?: string;
-  timestamp: number;
-  wsTime?: string;
+  quoteVolume: string;
+  numberOfTrades: number;
+  isClosed: boolean;
+  takerBuyVolume: string;
+  takerBuyQuoteVolume: string;
 }
 
-// Protocol Message Data (login, subscribe, etc.) - with 'any' for TypeScript usage
 export interface ProtocolMessageData {
   method: string;
   id?: string;
-  result?: any; // Using 'any' instead of 'unknown' for Nitro compatibility
-  error?: any; // Using 'any' instead of 'unknown' for Nitro compatibility
-  params?: any[]; // Using 'any' instead of 'unknown' for Nitro compatibility
-  stream?: string; // Stream name from response (e.g., "USDT_KDG@depth")
+  result?: any;
+  error?: any;
+  params?: any[];
+  stream?: string;
 }
 
-// Protocol Message Data (Nitro-compatible, no 'any' fields)
 export interface ProtocolMessageDataNitro {
   method: string;
   id?: string;
   stream?: string;
 }
 
-// Generic WebSocket Message Result (with 'any' for TypeScript usage)
+// ============================================================================
+// WebSocket Message Type Enum
+// ============================================================================
+
+export enum WebSocketMessageType {
+  // Market Data Types
+  DEPTH = 0,
+  TRADE = 1,
+  TICKER = 2,
+  KLINE = 3,
+
+  // User Data Types
+  USER_ORDER_UPDATE = 4,
+
+  // Unknown/Fallback (includes protocol messages and unrecognized types)
+  UNKNOWN = 7,
+}
+
+// ============================================================================
+// WebSocket Message Type String Helper
+// ============================================================================
+
+export const WebSocketMessageTypeString: Record<WebSocketMessageType, string> =
+  {
+    // Market Data Types
+    [WebSocketMessageType.DEPTH]: 'depth',
+    [WebSocketMessageType.TRADE]: 'trade',
+    [WebSocketMessageType.TICKER]: 'ticker',
+    [WebSocketMessageType.KLINE]: 'kline',
+
+    // User Data Types
+    [WebSocketMessageType.USER_ORDER_UPDATE]: 'userOrderUpdate',
+
+    // Unknown/Fallback (includes protocol messages and unrecognized types)
+    [WebSocketMessageType.UNKNOWN]: 'unknown',
+  };
+
 export interface WebSocketMessageResult {
   type: WebSocketMessageType;
-  raw: string; // Original JSON string
-  parsed: Record<string, any>; // Parsed JSON object (using 'any' instead of 'unknown' for Nitro compatibility)
-  // Type-specific data (only one will be populated based on type)
+  raw: string;
+  parsed: Record<string, any>;
   orderBookData?: OrderBookMessageData;
   tradeData?: TradeMessageData;
   tickerData?: TickerMessageData;
@@ -248,12 +217,10 @@ export interface WebSocketMessageResult {
   protocolData?: ProtocolMessageData;
 }
 
-// Generic WebSocket Message Result (Nitro-compatible, no 'any' fields)
 export interface WebSocketMessageResultNitro {
   type: WebSocketMessageType;
   raw: string;
   orderBookData?: OrderBookMessageData;
-  orderBookViewData?: OrderBookViewResult;
   tradeData?: TradeMessageData;
   tickerData?: TickerMessageData;
   klineData?: KlineMessageData;

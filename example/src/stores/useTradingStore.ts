@@ -1,9 +1,10 @@
 import type {
-  OrderBookViewResult,
   TickerMessageData,
   KlineMessageData,
   UserMessageData,
 } from '@cxptek/tp-sdk';
+import type { OrderBookViewResult } from '../types';
+import { getKlineProperties } from '../types';
 import { create } from 'zustand';
 
 interface Trade {
@@ -85,19 +86,23 @@ export const useTradingStore = create<TradingState>((set) => ({
   klines: [],
   addKline: (data: KlineMessageData) => {
     set((state: TradingState) => {
+      // Use helper function to extract properties
+      const dataProps = getKlineProperties(data);
+
       // Create lookup map for O(1) access instead of O(n) findIndex
       // Key: `${symbol}-${interval}-${openTime}` for unique identification
       const klineMap = new Map<string, KlineMessageData>();
       state.klines.forEach((kline) => {
-        const key = `${kline.symbol}-${kline.interval}-${
-          kline.openTime || kline.timestamp
+        const klineProps = getKlineProperties(kline);
+        const key = `${klineProps.symbol}-${klineProps.interval}-${
+          klineProps.openTime || klineProps.timestamp
         }`;
         klineMap.set(key, kline);
       });
 
       // Generate key for incoming kline
-      const dataKey = `${data.symbol}-${data.interval}-${
-        data.openTime || data.timestamp
+      const dataKey = `${dataProps.symbol}-${dataProps.interval}-${
+        dataProps.openTime || dataProps.timestamp
       }`;
       const existingKline = klineMap.get(dataKey);
 
@@ -106,8 +111,9 @@ export const useTradingStore = create<TradingState>((set) => ({
         // Update existing kline (current candle being updated)
         // Replace in array while maintaining order (newest first)
         newKlines = state.klines.map((kline) => {
-          const key = `${kline.symbol}-${kline.interval}-${
-            kline.openTime || kline.timestamp
+          const klineProps = getKlineProperties(kline);
+          const key = `${klineProps.symbol}-${klineProps.interval}-${
+            klineProps.openTime || klineProps.timestamp
           }`;
           return key === dataKey ? data : kline;
         });

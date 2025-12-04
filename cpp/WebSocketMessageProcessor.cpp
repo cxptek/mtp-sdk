@@ -5,6 +5,7 @@
 #include <sstream>
 #include <algorithm>
 #include <cctype>
+#include <string_view>
 
 namespace margelo::nitro::cxpmobile_tpsdk
 {
@@ -12,50 +13,395 @@ namespace margelo::nitro::cxpmobile_tpsdk
     std::unique_ptr<WebSocketMessageResultNitro> WebSocketMessageProcessor::processMessage(
         const std::string &messageJson)
     {
-        nlohmann::json j;
-        try
+        // Use thread-local parser and buffer for simdjson to reduce allocations
+        thread_local simdjson::ondemand::parser parser;
+        thread_local simdjson::padded_string paddedJsonBuffer;
+        // Track buffer size to avoid unnecessary reallocation
+        thread_local size_t paddedBufferSize = 0;
+
+        // OPTIMIZATION: Only reallocate if current buffer is too small
+        // padded_string doesn't expose capacity(), so we track size ourselves
+        if (paddedBufferSize < messageJson.size() + simdjson::SIMDJSON_PADDING)
         {
-            j = nlohmann::json::parse(messageJson);
+            // Need to reallocate - create new padded_string
+            paddedJsonBuffer = simdjson::padded_string(messageJson);
+            paddedBufferSize = messageJson.size() + simdjson::SIMDJSON_PADDING;
         }
-        catch (...)
+        else
+        {
+            // Reuse existing buffer - assignment operator will copy data efficiently
+        paddedJsonBuffer = messageJson;
+        }
+
+        auto docResult = parser.iterate(paddedJsonBuffer);
+
+        if (docResult.error() != simdjson::SUCCESS)
         {
             return nullptr;
         }
 
+        // Get document from result (use reference, document is not copyable)
+        simdjson::ondemand::document &doc = docResult.value();
+
         auto result = std::make_unique<WebSocketMessageResultNitro>();
-        result->raw = messageJson;
-        result->type = detectMessageType(j);
+
+        // Quick string-based detection first (before parsing) to avoid document invalidation
+        // Binance Combined Streams format: {"stream":"btcusdt@depth20@100ms","data":{...}}
+        bool isBinance = false;
+        WebSocketMessageType detectedType = WebSocketMessageType::UNKNOWN;
+
+        // Helper lambda to check if symbol is Binance format
+        // Binance: lowercase, no underscore (e.g., "btcusdt", "ethusdt")
+        // CXP: uppercase, has underscore (e.g., "BTC_USDT", "USDT_KDG")
+        auto isBinanceSymbol = [](const std::string_view &symbol) -> bool
+        {
+            if (symbol.empty())
+                return false;
+            // Check if has underscore -> CXP format
+            if (symbol.find('_') != std::string_view::npos)
+            {
+                return false; // CXP format
+            }
+            // Check if all lowercase -> Binance format
+            for (char c : symbol)
+            {
+                if (std::isupper(c))
+                {
+                    return false; // Has uppercase -> likely CXP
+                }
+            }
+            return true; // All lowercase, no underscore -> Binance
+        };
+
+        // Check stream format: {"stream":"SYMBOL@type","data":{...}}
+        // Extract symbol from stream to determine platform
+        size_t streamPos = messageJson.find("\"stream\"");
+        if (streamPos != std::string::npos)
+        {
+            // Find stream value: "stream":"SYMBOL@type"
+            size_t colonPos = messageJson.find(':', streamPos);
+            if (colonPos != std::string::npos)
+            {
+                size_t quoteStart = messageJson.find('"', colonPos);
+                if (quoteStart != std::string::npos)
+                {
+                    size_t quoteEnd = messageJson.find('"', quoteStart + 1);
+                    if (quoteEnd != std::string::npos)
+                    {
+                        // Extract stream string: "SYMBOL@type"
+                        std::string_view streamValue = std::string_view(messageJson).substr(quoteStart + 1, quoteEnd - quoteStart - 1);
+
+                        // Extract symbol (part before @)
+                        size_t atPos = streamValue.find('@');
+                        if (atPos != std::string_view::npos && atPos > 0)
+                        {
+                            std::string_view symbol = streamValue.substr(0, atPos);
+
+                            // Check symbol format to determine platform
+                            isBinance = isBinanceSymbol(symbol);
+
+                            // Detect message type from stream pattern
+                            if (streamValue.find("@depth") != std::string_view::npos)
+                            {
+                                detectedType = WebSocketMessageType::DEPTH;
+                            }
+                            else if (streamValue.find("@trade") != std::string_view::npos || streamValue.find("@aggTrade") != std::string_view::npos)
+                            {
+                                detectedType = WebSocketMessageType::TRADE;
+                            }
+                            else if (streamValue.find("@ticker") != std::string_view::npos || streamValue.find("@miniTicker") != std::string_view::npos || streamValue.find("!miniTicker@arr") != std::string_view::npos)
+                            {
+                                detectedType = WebSocketMessageType::TICKER;
+                            }
+                            else if (streamValue.find("@kline") != std::string_view::npos)
+                            {
+                                detectedType = WebSocketMessageType::KLINE;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // If not detected from stream, check direct event format: {"e":"depthUpdate","s":"SYMBOL",...}
+        if (detectedType == WebSocketMessageType::UNKNOWN)
+        {
+            // Check for symbol in "s" field: {"s":"SYMBOL",...}
+            size_t symbolFieldPos = messageJson.find("\"s\":");
+            if (symbolFieldPos != std::string::npos)
+            {
+                size_t symbolQuoteStart = messageJson.find('"', symbolFieldPos + 4);
+                if (symbolQuoteStart != std::string::npos)
+                {
+                    size_t symbolQuoteEnd = messageJson.find('"', symbolQuoteStart + 1);
+                    if (symbolQuoteEnd != std::string::npos)
+                    {
+                        std::string_view symbol = std::string_view(messageJson).substr(symbolQuoteStart + 1, symbolQuoteEnd - symbolQuoteStart - 1);
+                        isBinance = isBinanceSymbol(symbol);
+                    }
+                }
+            }
+
+            // Detect type from event field
+            if (messageJson.find("\"e\":\"depthUpdate\"") != std::string::npos)
+            {
+                detectedType = WebSocketMessageType::DEPTH;
+            }
+            else if (messageJson.find("\"e\":\"trade\"") != std::string::npos)
+            {
+                detectedType = WebSocketMessageType::TRADE;
+            }
+            else if (messageJson.find("\"e\":\"24hrTicker\"") != std::string::npos || messageJson.find("\"e\":\"miniTicker\"") != std::string::npos)
+            {
+                detectedType = WebSocketMessageType::TICKER;
+            }
+            else if (messageJson.find("\"e\":\"kline\"") != std::string::npos)
+            {
+                detectedType = WebSocketMessageType::KLINE;
+            }
+        }
+
+        if (isBinance)
+        {
+            result->type = detectedType;
+        }
+        else
+        {
+            // For CXP, use detectedType from string search if available
+            // Otherwise, parse document to detect type
+            if (detectedType != WebSocketMessageType::UNKNOWN)
+            {
+                result->type = detectedType;
+            }
+            else
+            {
+                if (paddedBufferSize < messageJson.size() + simdjson::SIMDJSON_PADDING)
+                {
+                    paddedJsonBuffer = simdjson::padded_string(messageJson);
+                    paddedBufferSize = messageJson.size() + simdjson::SIMDJSON_PADDING;
+                }
+                else
+                {
+                    paddedJsonBuffer = messageJson;
+                }
+                auto docResult2 = parser.iterate(paddedJsonBuffer);
+                if (docResult2.error() == simdjson::SUCCESS)
+                {
+                    simdjson::ondemand::document &doc2 = docResult2.value();
+                    result->type = detectMessageType(doc2);
+                }
+                else
+                {
+                    result->type = WebSocketMessageType::UNKNOWN;
+                }
+            }
+        }
 
         bool parsed = false;
+
         switch (result->type)
         {
-        case WebSocketMessageType::ORDER_BOOK_UPDATE:
-        case WebSocketMessageType::ORDER_BOOK_SNAPSHOT:
-            parsed = parseOrderBookMessage(j, messageJson, *result);
+        case WebSocketMessageType::DEPTH:
+            if (isBinance)
+            {
+                if (paddedBufferSize < messageJson.size() + simdjson::SIMDJSON_PADDING)
+                {
+                    paddedJsonBuffer = simdjson::padded_string(messageJson);
+                    paddedBufferSize = messageJson.size() + simdjson::SIMDJSON_PADDING;
+            }
+            else
+            {
+                    paddedJsonBuffer = messageJson;
+                }
+                auto docResultBinance = parser.iterate(paddedJsonBuffer);
+                if (docResultBinance.error() == simdjson::SUCCESS)
+                {
+                    simdjson::ondemand::document &docBinance = docResultBinance.value();
+                    parsed = parseBinanceOrderBookMessage(docBinance, *result);
+                }
+                else
+                {
+                    parsed = false;
+                }
+            }
+            else
+            {
+                if (paddedBufferSize < messageJson.size() + simdjson::SIMDJSON_PADDING)
+                {
+                    paddedJsonBuffer = simdjson::padded_string(messageJson);
+                    paddedBufferSize = messageJson.size() + simdjson::SIMDJSON_PADDING;
+                }
+                else
+                {
+                    paddedJsonBuffer = messageJson;
+                }
+                auto docResultCXP = parser.iterate(paddedJsonBuffer);
+                if (docResultCXP.error() == simdjson::SUCCESS)
+                {
+                    simdjson::ondemand::document &docCXP = docResultCXP.value();
+                    parsed = parseOrderBookMessage(docCXP, *result);
+                    if (!parsed)
+                    {
+                        std::cerr << "[WebSocketMessageProcessor] parseOrderBookMessage failed for CXP, message length=" << messageJson.size() << std::endl;
+                    }
+                }
+                else
+                {
+                    std::cerr << "[WebSocketMessageProcessor] Failed to parse CXP document, error=" << docResultCXP.error() << std::endl;
+                    parsed = false;
+                }
+            }
             break;
         case WebSocketMessageType::TRADE:
-            parsed = parseTradeMessage(j, *result);
+            if (isBinance)
+            {
+                // Re-parse document for Binance parsing to avoid invalidation issues
+                if (paddedBufferSize < messageJson.size() + simdjson::SIMDJSON_PADDING)
+                {
+                    paddedJsonBuffer = simdjson::padded_string(messageJson);
+                    paddedBufferSize = messageJson.size() + simdjson::SIMDJSON_PADDING;
+            }
+            else
+            {
+                    paddedJsonBuffer = messageJson;
+                }
+                auto docResultBinance = parser.iterate(paddedJsonBuffer);
+                if (docResultBinance.error() == simdjson::SUCCESS)
+                {
+                    simdjson::ondemand::document &docBinance = docResultBinance.value();
+                    parsed = parseBinanceTradeMessage(docBinance, *result);
+                }
+                else
+                {
+                    parsed = false;
+                }
+            }
+            else
+            {
+                // CXP format - re-parse if document might be invalidated
+                if (paddedBufferSize < messageJson.size() + simdjson::SIMDJSON_PADDING)
+                {
+                    paddedJsonBuffer = simdjson::padded_string(messageJson);
+                    paddedBufferSize = messageJson.size() + simdjson::SIMDJSON_PADDING;
+                }
+                else
+                {
+                    paddedJsonBuffer = messageJson;
+                }
+                auto docResultCXP = parser.iterate(paddedJsonBuffer);
+                if (docResultCXP.error() == simdjson::SUCCESS)
+                {
+                    simdjson::ondemand::document &docCXP = docResultCXP.value();
+                    parsed = parseTradeMessage(docCXP, *result);
+                }
+                else
+                {
+                    parsed = false;
+                }
+            }
             break;
         case WebSocketMessageType::TICKER:
-            parsed = parseTickerMessage(j, *result);
+            if (isBinance)
+            {
+                // Re-parse document for Binance parsing to avoid invalidation issues
+                if (paddedBufferSize < messageJson.size() + simdjson::SIMDJSON_PADDING)
+                {
+                    paddedJsonBuffer = simdjson::padded_string(messageJson);
+                    paddedBufferSize = messageJson.size() + simdjson::SIMDJSON_PADDING;
+            }
+            else
+            {
+                    paddedJsonBuffer = messageJson;
+                }
+                auto docResultBinance = parser.iterate(paddedJsonBuffer);
+                if (docResultBinance.error() == simdjson::SUCCESS)
+                {
+                    simdjson::ondemand::document &docBinance = docResultBinance.value();
+                    parsed = parseBinanceTickerMessage(docBinance, *result);
+                }
+                else
+                {
+                    parsed = false;
+                }
+            }
+            else
+            {
+                // CXP format - re-parse if document might be invalidated
+                if (paddedBufferSize < messageJson.size() + simdjson::SIMDJSON_PADDING)
+                {
+                    paddedJsonBuffer = simdjson::padded_string(messageJson);
+                    paddedBufferSize = messageJson.size() + simdjson::SIMDJSON_PADDING;
+                }
+                else
+                {
+                    paddedJsonBuffer = messageJson;
+                }
+                auto docResultCXP = parser.iterate(paddedJsonBuffer);
+                if (docResultCXP.error() == simdjson::SUCCESS)
+                {
+                    simdjson::ondemand::document &docCXP = docResultCXP.value();
+                    parsed = parseTickerMessage(docCXP, *result);
+                }
+                else
+                {
+                    parsed = false;
+                }
+            }
             break;
         case WebSocketMessageType::KLINE:
-            parsed = parseKlineMessage(j, *result);
-            break;
-        case WebSocketMessageType::PROTOCOL_LOGIN:
-        case WebSocketMessageType::PROTOCOL_SUBSCRIBE:
-        case WebSocketMessageType::PROTOCOL_UNSUBSCRIBE:
-        case WebSocketMessageType::PROTOCOL_ERROR:
-            parsed = parseProtocolMessage(j, *result);
+            if (isBinance)
+            {
+                // Re-parse document for Binance parsing to avoid invalidation issues
+                if (paddedBufferSize < messageJson.size() + simdjson::SIMDJSON_PADDING)
+                {
+                    paddedJsonBuffer = simdjson::padded_string(messageJson);
+                    paddedBufferSize = messageJson.size() + simdjson::SIMDJSON_PADDING;
+            }
+            else
+            {
+                    paddedJsonBuffer = messageJson;
+                }
+                auto docResultBinance = parser.iterate(paddedJsonBuffer);
+                if (docResultBinance.error() == simdjson::SUCCESS)
+                {
+                    simdjson::ondemand::document &docBinance = docResultBinance.value();
+                    parsed = parseBinanceKlineMessage(docBinance, *result);
+                }
+                else
+                {
+                    parsed = false;
+                }
+            }
+            else
+            {
+                // CXP format - re-parse if document might be invalidated
+                if (paddedBufferSize < messageJson.size() + simdjson::SIMDJSON_PADDING)
+                {
+                    paddedJsonBuffer = simdjson::padded_string(messageJson);
+                    paddedBufferSize = messageJson.size() + simdjson::SIMDJSON_PADDING;
+                }
+                else
+                {
+                    paddedJsonBuffer = messageJson;
+                }
+                auto docResultCXP = parser.iterate(paddedJsonBuffer);
+                if (docResultCXP.error() == simdjson::SUCCESS)
+                {
+                    simdjson::ondemand::document &docCXP = docResultCXP.value();
+                    parsed = parseKlineMessage(docCXP, *result);
+                }
+                else
+                {
+                    parsed = false;
+                }
+            }
             break;
         case WebSocketMessageType::USER_ORDER_UPDATE:
-        case WebSocketMessageType::USER_TRADE_UPDATE:
-        case WebSocketMessageType::USER_ACCOUNT_UPDATE:
-            parsed = parseUserDataMessage(j, *result);
+            parsed = parseUserDataMessage(doc, *result);
             break;
         default:
-            // Unknown type - still parse basic fields
-            parsed = true;
+            // For UNKNOWN messages, try to parse as protocol message
+            parsed = parseProtocolMessage(doc, *result);
             break;
         }
 
@@ -67,30 +413,27 @@ namespace margelo::nitro::cxpmobile_tpsdk
         return result;
     }
 
-    WebSocketMessageType WebSocketMessageProcessor::detectMessageType(const nlohmann::json &j)
+    WebSocketMessageType WebSocketMessageProcessor::detectMessageType(simdjson::ondemand::document &doc)
     {
-        if (!j.is_object())
+        auto root = doc.get_value();
+        if (root.error() != simdjson::SUCCESS)
         {
             return WebSocketMessageType::UNKNOWN;
         }
 
-        std::string method = JsonHelpers::getJsonString(j, "method");
-        if (!method.empty())
+        auto rootObj = root.value().get_object();
+        if (rootObj.error() != simdjson::SUCCESS)
         {
-            if (method == "login")
-                return WebSocketMessageType::PROTOCOL_LOGIN;
-            if (method == "subscribe")
-                return WebSocketMessageType::PROTOCOL_SUBSCRIBE;
-            if (method == "unsubscribe")
-                return WebSocketMessageType::PROTOCOL_UNSUBSCRIBE;
+            return WebSocketMessageType::UNKNOWN;
         }
 
-        std::string stream = JsonHelpers::getJsonString(j, "stream");
+        auto rootValue = root.value();
+        std::string stream = JsonHelpers::getJsonString(rootValue, "stream");
         if (!stream.empty())
         {
             if (stream.find("@depth") != std::string::npos)
             {
-                return WebSocketMessageType::ORDER_BOOK_UPDATE;
+                return WebSocketMessageType::DEPTH;
             }
             if (stream.find("@miniTicker") != std::string::npos || stream.find("@ticker") != std::string::npos)
             {
@@ -106,58 +449,69 @@ namespace margelo::nitro::cxpmobile_tpsdk
             }
             if (stream == "userData")
             {
-                nlohmann::json dataObj = j.value("data", nlohmann::json::object());
-                bool hasOrder = j.contains("order") || j.contains("orders") ||
-                                dataObj.contains("order") || dataObj.contains("orders");
-                bool hasTrade = j.contains("trade") || j.contains("trades") ||
-                                dataObj.contains("trade") || dataObj.contains("trades");
-                bool hasAccount = j.contains("account") || j.contains("assets") ||
-                                  dataObj.contains("account") || dataObj.contains("assets");
+                auto dataField = rootObj["data"];
+                bool hasOrder = false, hasTrade = false, hasAccount = false;
 
-                std::string eventType = JsonHelpers::getJsonString(j, "event");
-                std::string type = JsonHelpers::getJsonString(j, "type");
-                std::string eventTypeField = JsonHelpers::getJsonString(dataObj, "event");
+                if (dataField.error() == simdjson::SUCCESS)
+                {
+                    auto dataObj = dataField.value().get_object();
+                    if (dataObj.error() == simdjson::SUCCESS)
+                    {
+                        auto orderField = dataObj["order"];
+                        auto ordersField = dataObj["orders"];
+                        hasOrder = (orderField.error() == simdjson::SUCCESS || ordersField.error() == simdjson::SUCCESS);
+
+                        auto tradeField = dataObj["trade"];
+                        auto tradesField = dataObj["trades"];
+                        hasTrade = (tradeField.error() == simdjson::SUCCESS || tradesField.error() == simdjson::SUCCESS);
+
+                        auto accountField = dataObj["account"];
+                        auto assetsField = dataObj["assets"];
+                        hasAccount = (accountField.error() == simdjson::SUCCESS || assetsField.error() == simdjson::SUCCESS);
+                    }
+                }
+
+                // Check root level fields
+                auto orderField = rootObj["order"];
+                auto ordersField = rootObj["orders"];
+                if (orderField.error() == simdjson::SUCCESS || ordersField.error() == simdjson::SUCCESS)
+                    hasOrder = true;
+
+                auto tradeField = rootObj["trade"];
+                auto tradesField = rootObj["trades"];
+                if (tradeField.error() == simdjson::SUCCESS || tradesField.error() == simdjson::SUCCESS)
+                    hasTrade = true;
+
+                auto accountField = rootObj["account"];
+                auto assetsField = rootObj["assets"];
+                if (accountField.error() == simdjson::SUCCESS || assetsField.error() == simdjson::SUCCESS)
+                    hasAccount = true;
+
+                std::string eventType = JsonHelpers::getJsonString(rootValue, "event");
+                std::string type = JsonHelpers::getJsonString(rootValue, "type");
+
+                std::string eventTypeField;
+                if (dataField.error() == simdjson::SUCCESS)
+                {
+                    // Get value directly from field, not from object
+                    auto dataValue = dataField.value();
+                    eventTypeField = JsonHelpers::getJsonString(dataValue, "event");
+                }
 
                 if (hasOrder || eventType == "orderUpdate" || type == "orderUpdate" || eventTypeField == "orderUpdate")
                 {
                     return WebSocketMessageType::USER_ORDER_UPDATE;
-                }
-                if (hasTrade || eventType == "tradeUpdate" || type == "tradeUpdate" || eventTypeField == "tradeUpdate")
-                {
-                    return WebSocketMessageType::USER_TRADE_UPDATE;
-                }
-                if (hasAccount || eventType == "accountUpdate" || type == "accountUpdate" || eventTypeField == "accountUpdate")
-                {
-                    return WebSocketMessageType::USER_ACCOUNT_UPDATE;
                 }
 
                 return WebSocketMessageType::USER_ORDER_UPDATE;
             }
         }
 
-        std::string id = JsonHelpers::getJsonString(j, "id");
-        bool hasResult = j.contains("result");
-        bool hasError = j.contains("error");
-
-        if (!id.empty() && (hasResult || hasError) && stream.empty())
-        {
-            if (hasError)
-            {
-                return WebSocketMessageType::PROTOCOL_ERROR;
-            }
-            return WebSocketMessageType::PROTOCOL_SUBSCRIBE;
-        }
-
-        if (hasError || !JsonHelpers::getJsonString(j, "code").empty())
-        {
-            return WebSocketMessageType::PROTOCOL_ERROR;
-        }
-
         // Check CXP event-based format (e.g., {"e":"depthUpdate",...})
-        std::string eventType = JsonHelpers::getJsonString(j, "e");
+        std::string eventType = JsonHelpers::getJsonString(rootValue, "e");
         if (eventType == "depthUpdate")
         {
-            return WebSocketMessageType::ORDER_BOOK_UPDATE;
+            return WebSocketMessageType::DEPTH;
         }
         if (eventType == "trade")
         {
@@ -172,166 +526,336 @@ namespace margelo::nitro::cxpmobile_tpsdk
         {
             return WebSocketMessageType::USER_ORDER_UPDATE;
         }
-        if (eventType == "tradeUpdate" || eventType == "executionReport")
+
+        // Check Binance format (after CXP format to prioritize CXP)
+        if (isBinanceFormat(doc))
         {
-            // Check if it's a trade by looking for trade-specific fields
-            if (j.contains("t") || j.contains("tradeId"))
-            {
-                return WebSocketMessageType::USER_TRADE_UPDATE;
-            }
-            // If it has "c": "TRADE", it's a trade
-            std::string c = JsonHelpers::getJsonString(j, "c");
-            if (c == "TRADE")
-            {
-                return WebSocketMessageType::USER_TRADE_UPDATE;
-            }
-            // Otherwise it's an order update
-            return WebSocketMessageType::USER_ORDER_UPDATE;
-        }
-        if (eventType == "accountUpdate" || eventType == "outboundAccountPosition")
-        {
-            return WebSocketMessageType::USER_ACCOUNT_UPDATE;
+            return getBinanceStreamType(doc);
         }
 
         return WebSocketMessageType::UNKNOWN;
     }
 
     bool WebSocketMessageProcessor::parseOrderBookMessage(
-        const nlohmann::json &j,
-        const std::string &json,
+        simdjson::ondemand::document &doc,
         WebSocketMessageResultNitro &result)
     {
-        std::vector<OrderBookLevel> bids;
-        std::vector<OrderBookLevel> asks;
+        // Use pre-allocated buffers to avoid reallocation
+        auto &buffers = TpSdkCppHybrid::threadLocalBuffers_;
+        buffers.depthBidsBuffer.clear();
+        buffers.depthAsksBuffer.clear();
 
-        bool parsed = false;
+        std::vector<std::tuple<std::string, std::string>> &bids = buffers.depthBidsBuffer;
+        std::vector<std::tuple<std::string, std::string>> &asks = buffers.depthAsksBuffer;
+
         std::string symbol;
-        bool isSnapshot = false;
+        bool hasBids = false;
+        bool hasAsks = false;
 
         try
         {
-            if (parseDepthUpdateStream(json, bids, asks))
+            auto root = doc.get_value();
+            if (root.error() != simdjson::SUCCESS)
             {
-                symbol = JsonHelpers::getJsonString(j, "s");
-                isSnapshot = false;
-                parsed = true;
+                return false;
             }
-            else if (parseDepthUpdateByStream(json, bids, asks))
+
+            auto rootObj = root.value().get_object();
+            if (rootObj.error() != simdjson::SUCCESS)
             {
-                std::string stream = JsonHelpers::getJsonString(j, "stream");
-                size_t atPos = stream.find('@');
-                if (atPos != std::string::npos)
+                return false;
+            }
+
+            auto rootValue = root.value();
+
+            // Check for CXP format: {"e":"depthUpdate","b":[...],"a":[...]}
+            std::string eventType = JsonHelpers::getJsonString(rootValue, "e");
+            if (eventType == "depthUpdate")
+            {
+                auto bField = rootObj["b"];
+                if (bField.error() == simdjson::SUCCESS)
                 {
-                    symbol = stream.substr(0, atPos);
+                    auto bValue = bField.value();
+                    hasBids = JsonHelpers::extractRawStringArrayFromJson(bValue, bids);
                 }
                 else
                 {
-                    symbol = stream;
+                    std::cerr << "[WebSocketMessageProcessor] parseOrderBookMessage: rootObj[b] error=" << bField.error() << std::endl;
                 }
-                isSnapshot = false;
-                parsed = true;
+                auto aField = rootObj["a"];
+                if (aField.error() == simdjson::SUCCESS)
+                {
+                    auto aValue = aField.value();
+                    hasAsks = JsonHelpers::extractRawStringArrayFromJson(aValue, asks);
+                }
+                else
+                {
+                    std::cerr << "[WebSocketMessageProcessor] parseOrderBookMessage: rootObj[a] error=" << aField.error() << std::endl;
+                }
+                symbol = JsonHelpers::getJsonString(rootValue, "s");
             }
+            // Check for CXP stream format: {"stream":"...@depth","data":{"e":"depthUpdate","b":[...],"a":[...]}}
+            else
+            {
+                auto streamField = rootObj["stream"];
+                auto dataField = rootObj["data"];
+                if (streamField.error() == simdjson::SUCCESS && dataField.error() == simdjson::SUCCESS)
+                {
+                    auto streamValue = streamField.value();
+                    auto streamStr = streamValue.get_string();
+                    if (streamStr.error() == simdjson::SUCCESS)
+                    {
+                        std::string_view streamView(streamStr.value());
+                        if (streamView.find("@depth") != std::string_view::npos)
+                        {
+                            auto dataValue = dataField.value();
+                            auto dataObj = dataValue.get_object();
+                            if (dataObj.error() == simdjson::SUCCESS)
+                            {
+                                auto bField = dataObj["b"];
+                                if (bField.error() == simdjson::SUCCESS)
+                                {
+                                    auto bValue = bField.value();
+                                    hasBids = JsonHelpers::extractRawStringArrayFromJson(bValue, bids);
+                                }
+                                else
+                                {
+                                    std::cerr << "[WebSocketMessageProcessor] parseOrderBookMessage: dataObj[b] error=" << bField.error() << std::endl;
+                                }
+                                auto aField = dataObj["a"];
+                                if (aField.error() == simdjson::SUCCESS)
+                                {
+                                    auto aValue = aField.value();
+                                    hasAsks = JsonHelpers::extractRawStringArrayFromJson(aValue, asks);
+                                }
+                                else
+                                {
+                                    std::cerr << "[WebSocketMessageProcessor] parseOrderBookMessage: dataObj[a] error=" << aField.error() << std::endl;
+                                }
+                            }
+                            else
+                            {
+                                std::cerr << "[WebSocketMessageProcessor] parseOrderBookMessage: dataObj error=" << dataObj.error() << std::endl;
+                            }
+
+                            size_t atPos = streamView.find('@');
+                            if (atPos != std::string_view::npos)
+                            {
+                                symbol.assign(streamView.data(), atPos);
+                            }
+                            else
+                            {
+                                symbol.assign(streamView.data(), streamView.length());
+                            }
+                        }
+                        else
+                        {
+                            std::cerr << "[WebSocketMessageProcessor] parseOrderBookMessage: stream does not contain @depth, stream=" << std::string(streamView) << std::endl;
+                            }
+                        }
+                    else
+                    {
+                        std::cerr << "[WebSocketMessageProcessor] parseOrderBookMessage: streamStr error=" << streamStr.error() << std::endl;
+                    }
+                }
+                else
+                {
+                    std::cerr << "[WebSocketMessageProcessor] parseOrderBookMessage: streamField error=" << streamField.error()
+                              << ", dataField error=" << dataField.error() << std::endl;
+                }
+            }
+
+            // Allow empty bids or asks (but not both empty)
+            if (!hasBids && !hasAsks)
+            {
+                std::cerr << "[WebSocketMessageProcessor] parseOrderBookMessage: No bids or asks found, symbol=" << symbol << std::endl;
+                return false;
+            }
+
+            // Extract all fields from socket message
+            // Determine which JSON object to use (root or nested data)
+            auto dataField = rootObj["data"];
+            simdjson::ondemand::value dataValue = rootValue;
+            if (dataField.error() == simdjson::SUCCESS)
+            {
+                // Get value directly from field, not from object
+                dataValue = dataField.value();
+            }
+
+            std::string eventTypeFinal = JsonHelpers::getJsonString(dataValue, "e");
+            if (eventTypeFinal.empty())
+            {
+                eventTypeFinal = JsonHelpers::getJsonString(rootValue, "e");
+                if (eventTypeFinal.empty())
+                {
+                    eventTypeFinal = "depthUpdate";
+                }
+            }
+            double eventTime = JsonHelpers::getJsonDouble(dataValue, "E", 0.0);
+            if (eventTime == 0.0)
+            {
+                eventTime = JsonHelpers::getJsonDouble(rootValue, "E", 0.0);
+            }
+            std::string firstUpdateId = JsonHelpers::getJsonString(dataValue, "U");
+            if (firstUpdateId.empty())
+            {
+                firstUpdateId = JsonHelpers::getJsonString(rootValue, "U");
+            }
+            std::string finalUpdateId = JsonHelpers::getJsonString(dataValue, "u");
+            if (finalUpdateId.empty())
+            {
+                finalUpdateId = JsonHelpers::getJsonString(rootValue, "u");
+            }
+            double dsTime = JsonHelpers::getJsonDouble(dataValue, "dsTime", 0.0);
+            if (dsTime == 0.0)
+            {
+                dsTime = JsonHelpers::getJsonDouble(rootValue, "dsTime", 0.0);
+            }
+            double wsTime = JsonHelpers::getJsonDouble(rootValue, "wsTime", 0.0);
+            std::string stream = JsonHelpers::getJsonString(rootValue, "stream");
+
+            // Create OrderBookDataItem with new field names
+            // Bids/asks are already in pre-allocated buffers, move them to dataItem
+            OrderBookDataItem dataItem;
+            dataItem.eventType = eventTypeFinal;
+            dataItem.eventTime = eventTime;
+            dataItem.symbol = symbol;
+            dataItem.firstUpdateId = firstUpdateId;
+            dataItem.finalUpdateId = finalUpdateId;
+            dataItem.bids = std::move(bids); // Move from pre-allocated buffer
+            dataItem.asks = std::move(asks); // Move from pre-allocated buffer
+            dataItem.dsTime = dsTime;
+
+            // Create OrderBookMessageData directly (no need for object pool here)
+            // Object pool was causing memory leaks due to unreleased objects
+            OrderBookMessageData orderBookData;
+            orderBookData.data = std::move(dataItem);
+            orderBookData.wsTime = wsTime;
+            orderBookData.stream = std::move(stream);
+
+            // Move into result to avoid copy
+            result.orderBookData = std::move(orderBookData);
+            result.type = WebSocketMessageType::DEPTH;
+
+            return true;
         }
         catch (...)
         {
             // JSON parsing failed
             return false;
         }
-
-        if (!parsed || (bids.empty() && asks.empty()))
-        {
-            return false;
-        }
-
-        // Store raw bids/asks in orderBookData (for state merging in TpSdkCppHybrid)
-        // Formatting will be done in TpSdkCppHybrid using actual config values
-        OrderBookMessageData orderBookData;
-        orderBookData.bids = bids;
-        orderBookData.asks = asks;
-        orderBookData.symbol = symbol;
-        result.orderBookData = orderBookData;
-
-        return true;
     }
 
     bool WebSocketMessageProcessor::parseTradeMessage(
-        const nlohmann::json &j,
+        simdjson::ondemand::document &doc,
         WebSocketMessageResultNitro &result)
     {
         try
         {
+            auto root = doc.get_value();
+            if (root.error() != simdjson::SUCCESS)
+            {
+                return false;
+            }
+
+            auto rootObj = root.value().get_object();
+            if (rootObj.error() != simdjson::SUCCESS)
+            {
+                return false;
+            }
+
+            auto rootValue = root.value();
+
             // CXP format: {"stream":"USDT_KDG@trade","data":{...}}
-            std::string stream = JsonHelpers::getJsonString(j, "stream");
+            std::string stream = JsonHelpers::getJsonString(rootValue, "stream");
+            double wsTime = JsonHelpers::getJsonDouble(rootValue, "wsTime", 0.0);
+            double dsTime = JsonHelpers::getJsonDouble(rootValue, "dsTime", 0.0);
 
             if (!stream.empty() && stream.find("@trade") != std::string::npos)
             {
-                TradeMessageData tradeData;
-
-                // Extract symbol from stream (e.g., "USDT_KDG@trade" -> "USDT_KDG")
-                size_t atPos = stream.find('@');
-                if (atPos != std::string::npos)
+                std::string symbol;
+                std::string_view streamView(stream);
+                size_t atPos = streamView.find('@');
+                if (atPos != std::string_view::npos)
                 {
-                    tradeData.symbol = stream.substr(0, atPos);
+                    symbol.assign(streamView.data(), atPos);
                 }
 
-                if (j.contains("data"))
+                // Use pre-allocated thread-local buffer for trade items
+                auto &buffers = TpSdkCppHybrid::threadLocalBuffers_;
+                buffers.tradesBuffer.clear();
+                std::vector<TradeDataItem> &tradeItems = buffers.tradesBuffer;
+
+                auto dataField = rootObj["data"];
+                if (dataField.error() == simdjson::SUCCESS)
                 {
-                    nlohmann::json dataObj = j["data"];
+                    auto dataValue = dataField.value();
+
+                    // Reserve capacity upfront - typical trade messages have 1-10 items
+                    // Reserve more to avoid reallocation during burst
+                    if (tradeItems.capacity() < 20)
+                    {
+                        tradeItems.reserve(20);
+                    }
 
                     // Helper lambda to parse a single trade object
-                    auto parseSingleTrade = [&tradeData](const nlohmann::json &tradeObj) -> TradeMessageData
+                    // Optimized: direct field extraction without redundant checks
+                    auto parseSingleTrade = [&symbol](simdjson::ondemand::value &tradeObj) -> TradeDataItem
                     {
-                        TradeMessageData singleTrade = tradeData; // Copy symbol
-                        singleTrade.price = JsonHelpers::getJsonString(tradeObj, "p");
-                        singleTrade.quantity = JsonHelpers::getJsonString(tradeObj, "q");
+                        TradeDataItem item;
 
-                        // Check for 'side' field first, if not found, use 'm' (maker)
-                        std::string sideStr = JsonHelpers::getJsonString(tradeObj, "side");
-                        if (!sideStr.empty())
-                        {
-                            singleTrade.side = stringToTradeSide(sideStr);
-                        }
-                        else
-                        {
-                            // Convert 'm' (maker) to side: m=false -> BUY, m=true -> SELL
-                            bool isMaker = JsonHelpers::getJsonBool(tradeObj, "m", false);
-                            singleTrade.side = isMaker ? TradeSide::SELL : TradeSide::BUY;
-                        }
+                        std::string eventType = JsonHelpers::getJsonString(tradeObj, "e");
+                        item.eventType = eventType.empty() ? "trade" : eventType;
+                        item.eventTime = JsonHelpers::getJsonDouble(tradeObj, "E", 0.0);
 
-                        singleTrade.timestamp = JsonHelpers::getJsonDouble(tradeObj, "T", 0.0);
-                        std::string tradeId = JsonHelpers::getJsonString(tradeObj, "t");
-                        if (!tradeId.empty())
-                        {
-                            singleTrade.tradeId = std::move(tradeId);
-                        }
-                        return singleTrade;
+                        std::string tradeSymbol = JsonHelpers::getJsonString(tradeObj, "s");
+                        item.symbol = tradeSymbol.empty() ? symbol : tradeSymbol;
+
+                        item.tradeId = JsonHelpers::getJsonString(tradeObj, "t");
+                        item.price = JsonHelpers::getJsonString(tradeObj, "p");
+                        item.quantity = JsonHelpers::getJsonString(tradeObj, "q");
+                        item.tradeTime = JsonHelpers::getJsonDouble(tradeObj, "T", 0.0);
+                        item.isBuyerMaker = JsonHelpers::getJsonBool(tradeObj, "m", false);
+
+                        return item;
                     };
 
                     // Check if data is an array (multiple trades) or object (single trade)
-                    if (dataObj.is_array())
+                    if (dataValue.type() == simdjson::ondemand::json_type::array)
                     {
                         // Array format - parse all trades
-                        for (const auto &tradeObj : dataObj)
+                        auto dataArr = dataValue.get_array();
+                        if (dataArr.error() == simdjson::SUCCESS)
                         {
-                            if (tradeObj.is_object())
+                            for (auto tradeElem : dataArr)
                             {
-                                TradeMessageData singleTrade = parseSingleTrade(tradeObj);
-                                // Store first trade in result, others will be processed via callback queue
-                                if (!result.tradeData.has_value())
+                                if (tradeElem.error() == simdjson::SUCCESS)
                                 {
-                                    result.tradeData = std::move(singleTrade);
-                                    return true;
+                                    auto tradeObj = tradeElem.value();
+                                    if (tradeObj.type() == simdjson::ondemand::json_type::object)
+                                    {
+                                        tradeItems.push_back(parseSingleTrade(tradeObj));
+                                    }
                                 }
                             }
                         }
                     }
-                    else if (dataObj.is_object())
+                    else if (dataValue.type() == simdjson::ondemand::json_type::object)
                     {
                         // Object format - single trade
-                        tradeData = parseSingleTrade(dataObj);
-                        result.tradeData = std::move(tradeData);
-                        return true;
+                        tradeItems.push_back(parseSingleTrade(dataValue));
                     }
+                }
+
+                if (!tradeItems.empty())
+                {
+                    TradeMessageData tradeData;
+                    tradeData.stream = std::move(stream);
+                    tradeData.wsTime = wsTime;
+                    tradeData.dsTime = dsTime;
+                    tradeData.data = std::move(tradeItems);
+                    result.tradeData = std::move(tradeData);
+                    return true;
                 }
             }
         }
@@ -345,81 +869,107 @@ namespace margelo::nitro::cxpmobile_tpsdk
     }
 
     bool WebSocketMessageProcessor::parseTickerMessage(
-        const nlohmann::json &j,
+        simdjson::ondemand::document &doc,
         WebSocketMessageResultNitro &result)
     {
         try
         {
+            auto root = doc.get_value();
+            if (root.error() != simdjson::SUCCESS)
+            {
+                return false;
+            }
+
+            auto rootObj = root.value().get_object();
+            if (rootObj.error() != simdjson::SUCCESS)
+            {
+                return false;
+            }
+
+            auto rootValue = root.value();
+
             // CXP format: {"stream":"USDT_KDG@miniTicker","data":{...}}
             // Or: {"stream":"!miniTicker@arr","data":[{...}]} (array of tickers)
-            std::string stream = JsonHelpers::getJsonString(j, "stream");
+            std::string stream = JsonHelpers::getJsonString(rootValue, "stream");
+            double wsTime = JsonHelpers::getJsonDouble(rootValue, "wsTime", 0.0);
+
             if (!stream.empty() && (stream.find("@miniTicker") != std::string::npos || stream.find("@ticker") != std::string::npos))
             {
-                TickerMessageData tickerData;
-
-                // Extract symbol from stream (e.g., "USDT_KDG@miniTicker" -> "USDT_KDG")
-                // For array format "!miniTicker@arr", symbol will be extracted from data
-                size_t atPos = stream.find('@');
-                if (atPos != std::string::npos && stream[0] != '!')
+                std::string symbol;
+                std::string_view streamView(stream);
+                size_t atPos = streamView.find('@');
+                if (atPos != std::string_view::npos && streamView[0] != '!')
                 {
-                    tickerData.symbol = stream.substr(0, atPos);
+                    symbol.assign(streamView.data(), atPos);
                 }
 
-                if (j.contains("data"))
+                auto dataField = rootObj["data"];
+                if (dataField.error() == simdjson::SUCCESS)
                 {
-                    nlohmann::json dataObj = j["data"];
+                    auto dataValue = dataField.value();
 
                     // Check if it's an array (for !miniTicker@arr)
-                    if (dataObj.is_array() && !dataObj.empty())
+                    simdjson::ondemand::value finalDataValue = dataValue;
+                    if (dataValue.type() == simdjson::ondemand::json_type::array)
                     {
-                        // Array format - take first element
-                        dataObj = dataObj[0];
+                        auto dataArr = dataValue.get_array();
+                        if (dataArr.error() == simdjson::SUCCESS)
+                        {
+                            auto firstElem = *dataArr.begin();
+                            if (firstElem.error() == simdjson::SUCCESS)
+                            {
+                                finalDataValue = firstElem.value();
+                            }
+                        }
                     }
 
-                    if (dataObj.is_object())
+                    if (finalDataValue.type() == simdjson::ondemand::json_type::object)
                     {
                         // Extract symbol from data if not already set (for array format)
-                        if (tickerData.symbol.empty())
+                        std::string tickerSymbol = JsonHelpers::getJsonString(finalDataValue, "s");
+                        if (tickerSymbol.empty())
                         {
-                            tickerData.symbol = JsonHelpers::getJsonString(dataObj, "s");
+                            tickerSymbol = symbol;
                         }
 
-                        // Parse price fields: c (current/close), o (open), h (high), l (low)
-                        std::string currentPriceStr = JsonHelpers::getJsonString(dataObj, "c");
-                        std::string openPriceStr = JsonHelpers::getJsonString(dataObj, "o");
-                        std::string highPriceStr = JsonHelpers::getJsonString(dataObj, "h");
-                        std::string lowPriceStr = JsonHelpers::getJsonString(dataObj, "l");
-                        std::string volumeStr = JsonHelpers::getJsonString(dataObj, "v");
-                        std::string quoteVolumeStr = JsonHelpers::getJsonString(dataObj, "q");
-
-                        // Parse timestamp from E (event time) or dsTime
-                        std::string timestampStr = JsonHelpers::getJsonString(dataObj, "E");
-                        if (timestampStr.empty())
+                        // Parse fields with new names
+                        std::string eventType = JsonHelpers::getJsonString(finalDataValue, "e");
+                        if (eventType.empty())
                         {
-                            timestampStr = JsonHelpers::getJsonString(dataObj, "dsTime");
+                            eventType = "24hrTicker";
                         }
-                        double timestamp = parseDouble(timestampStr);
+                        double eventTime = JsonHelpers::getJsonDouble(finalDataValue, "E", 0.0);
+                        std::string closePrice = JsonHelpers::getJsonString(finalDataValue, "c");
+                        std::string openPrice = JsonHelpers::getJsonString(finalDataValue, "o");
+                        std::string highPrice = JsonHelpers::getJsonString(finalDataValue, "h");
+                        std::string lowPrice = JsonHelpers::getJsonString(finalDataValue, "l");
+                        std::string volume = JsonHelpers::getJsonString(finalDataValue, "v");
+                        std::string quoteVolume = JsonHelpers::getJsonString(finalDataValue, "q");
+                        double dsTime = JsonHelpers::getJsonDouble(finalDataValue, "dsTime", 0.0);
 
-                        // Calculate priceChange and priceChangePercent
-                        double currentPrice = parseDouble(currentPriceStr);
-                        double openPrice = parseDouble(openPriceStr);
-                        double priceChange = currentPrice - openPrice;
-                        double priceChangePercent = 0.0;
-                        if (openPrice > 0.0)
-                        {
-                            priceChangePercent = (priceChange / openPrice) * 100.0;
-                        }
+                        // Use pre-allocated buffer for ticker object (reuse to avoid allocation)
+                        auto &buffers = TpSdkCppHybrid::threadLocalBuffers_;
 
-                        // Set all fields
-                        tickerData.currentPrice = std::move(currentPriceStr);
-                        tickerData.openPrice = std::move(openPriceStr);
-                        tickerData.highPrice = std::move(highPriceStr);
-                        tickerData.lowPrice = std::move(lowPriceStr);
-                        tickerData.volume = std::move(volumeStr);
-                        tickerData.quoteVolume = std::move(quoteVolumeStr);
-                        tickerData.priceChange = formatDouble(priceChange);
-                        tickerData.priceChangePercent = formatDouble(priceChangePercent);
-                        tickerData.timestamp = timestamp;
+                        // Create TickerDataItem
+                        TickerDataItem dataItem;
+                        dataItem.eventType = eventType;
+                        dataItem.eventTime = eventTime;
+                        dataItem.symbol = tickerSymbol;
+                        dataItem.closePrice = closePrice;
+                        dataItem.openPrice = openPrice;
+                        dataItem.highPrice = highPrice;
+                        dataItem.lowPrice = lowPrice;
+                        dataItem.volume = volume;
+                        dataItem.quoteVolume = quoteVolume;
+                        dataItem.dsTime = dsTime;
+
+                        // Reuse pre-allocated ticker buffer
+                        buffers.tickerBuffer.data = dataItem;
+                        buffers.tickerBuffer.wsTime = wsTime;
+                        buffers.tickerBuffer.stream = std::move(stream);
+
+                        // Move from buffer to result
+                        TickerMessageData tickerData = std::move(buffers.tickerBuffer);
 
                         result.tickerData = std::move(tickerData);
                         return true;
@@ -437,24 +987,32 @@ namespace margelo::nitro::cxpmobile_tpsdk
     }
 
     bool WebSocketMessageProcessor::parseProtocolMessage(
-        const nlohmann::json &j,
+        simdjson::ondemand::document &doc,
         WebSocketMessageResultNitro &result)
     {
         try
         {
+            auto root = doc.get_value();
+            if (root.error() != simdjson::SUCCESS)
+            {
+                return false;
+            }
+
+            auto rootValue = root.value();
+
             ProtocolMessageDataNitro protocolData;
 
             // Extract method (for outgoing requests)
-            protocolData.method = JsonHelpers::getJsonString(j, "method");
+            protocolData.method = JsonHelpers::getJsonString(rootValue, "method");
 
             // Extract id and stream from response (e.g., {"result":null,"id":"...","stream":"USDT_KDG@depth"})
-            std::string id = JsonHelpers::getJsonString(j, "id");
+            std::string id = JsonHelpers::getJsonString(rootValue, "id");
             if (!id.empty())
             {
                 protocolData.id = id;
             }
 
-            std::string stream = JsonHelpers::getJsonString(j, "stream");
+            std::string stream = JsonHelpers::getJsonString(rootValue, "stream");
             if (!stream.empty())
             {
                 protocolData.stream = stream;
@@ -471,85 +1029,171 @@ namespace margelo::nitro::cxpmobile_tpsdk
     }
 
     bool WebSocketMessageProcessor::parseUserDataMessage(
-        const nlohmann::json &j,
+        simdjson::ondemand::document &doc,
         WebSocketMessageResultNitro &result)
     {
         try
         {
-            UserMessageData userData;
-
-            // Parse all fields directly from JSON (only set if present and not null)
-            // Helper lambda to set optional string field
-            auto setStringField = [&](const std::string &key, std::optional<std::string> &field)
+            auto root = doc.get_value();
+            if (root.error() != simdjson::SUCCESS)
             {
-                if (j.contains(key) && !j[key].is_null())
+                return false;
+            }
+
+            auto rootObj = root.value().get_object();
+            if (rootObj.error() != simdjson::SUCCESS)
+            {
+                return false;
+            }
+
+            auto rootValue = root.value();
+
+            std::string stream = JsonHelpers::getJsonString(rootValue, "stream");
+            double wsTime = JsonHelpers::getJsonDouble(rootValue, "wsTime", 0.0);
+
+            // Parse eventType and eventTime from "e" and "E" fields
+            std::string eventType = JsonHelpers::getJsonString(rootValue, "e");
+            if (eventType.empty())
+            {
+                eventType = JsonHelpers::getJsonString(rootValue, "eventType");
+            }
+            if (eventType.empty())
+            {
+                eventType = JsonHelpers::getJsonString(rootValue, "event");
+            }
+            if (eventType.empty())
+            {
+                eventType = "orderUpdate";
+            }
+            double eventTime = JsonHelpers::getJsonDouble(rootValue, "E", 0.0);
+
+            // Create UserDataItem
+            UserDataItem dataItem;
+            dataItem.eventType = eventType;
+            dataItem.eventTime = eventTime;
+
+            // Helper lambda to set optional string field
+            auto setStringField = [&rootValue, &rootObj](const std::string &key, std::optional<std::string> &field)
+            {
+                auto fieldVal = rootObj[key];
+                if (fieldVal.error() == simdjson::SUCCESS)
                 {
-                    std::string value = JsonHelpers::getJsonString(j, key);
-                    if (!value.empty())
+                    auto val = fieldVal.value();
+                    if (val.type() != simdjson::ondemand::json_type::null)
                     {
-                        field = value;
+                        std::string value = JsonHelpers::getJsonString(rootValue, key);
+                        if (!value.empty())
+                        {
+                            field = value;
+                        }
                     }
                 }
             };
 
-            // Parse all string fields
-            setStringField("id", userData.id);
-            setStringField("userId", userData.userId);
-            setStringField("symbolCode", userData.symbolCode);
-            setStringField("action", userData.action);
-            setStringField("type", userData.type);
-            setStringField("status", userData.status);
-            setStringField("price", userData.price);
-            setStringField("quantity", userData.quantity);
-            setStringField("baseFilled", userData.baseFilled);
-            setStringField("quoteFilled", userData.quoteFilled);
-            setStringField("quoteQuantity", userData.quoteQuantity);
-            setStringField("fee", userData.fee);
-            setStringField("feeAsset", userData.feeAsset);
-            setStringField("matchingPrice", userData.matchingPrice);
-            setStringField("avgPrice", userData.avgPrice);
-            setStringField("avrPrice", userData.avrPrice);
-            setStringField("canceledBy", userData.canceledBy);
-            setStringField("createdAt", userData.createdAt);
-            setStringField("updatedAt", userData.updatedAt);
-            setStringField("submittedAt", userData.submittedAt);
-            setStringField("dsTime", userData.dsTime);
-            setStringField("triggerPrice", userData.triggerPrice);
-            setStringField("conditionalOrderType", userData.conditionalOrderType);
-            setStringField("timeInForce", userData.timeInForce);
-            setStringField("triggerStatus", userData.triggerStatus);
-            setStringField("placeOrderReason", userData.placeOrderReason);
-            setStringField("contingencyType", userData.contingencyType);
-            setStringField("refId", userData.refId);
-            setStringField("reduceVolume", userData.reduceVolume);
-            setStringField("rejectedVolume", userData.rejectedVolume);
-            setStringField("rejectedBudget", userData.rejectedBudget);
-            setStringField("e", userData.e);
-            setStringField("E", userData.E);
-            setStringField("eventType", userData.eventType);
-            setStringField("event", userData.event);
-            setStringField("stream", userData.stream);
+            // Parse all optional string fields
+            setStringField("id", dataItem.id);
+            setStringField("userId", dataItem.userId);
+            setStringField("symbolCode", dataItem.symbolCode);
+            setStringField("action", dataItem.action);
+            setStringField("type", dataItem.type);
+            setStringField("status", dataItem.status);
+            setStringField("price", dataItem.price);
+            setStringField("quantity", dataItem.quantity);
+            setStringField("baseFilled", dataItem.baseFilled);
+            setStringField("quoteFilled", dataItem.quoteFilled);
+            setStringField("quoteQuantity", dataItem.quoteQuantity);
+            setStringField("fee", dataItem.fee);
+            setStringField("feeAsset", dataItem.feeAsset);
+            setStringField("matchingPrice", dataItem.matchingPrice);
+            setStringField("avgPrice", dataItem.avgPrice);
+            setStringField("avrPrice", dataItem.avrPrice);
+            setStringField("canceledBy", dataItem.canceledBy);
+            setStringField("triggerPrice", dataItem.triggerPrice);
+            setStringField("conditionalOrderType", dataItem.conditionalOrderType);
+            setStringField("timeInForce", dataItem.timeInForce);
+            setStringField("triggerStatus", dataItem.triggerStatus);
+            setStringField("placeOrderReason", dataItem.placeOrderReason);
+            setStringField("contingencyType", dataItem.contingencyType);
+            setStringField("refId", dataItem.refId);
+            setStringField("reduceVolume", dataItem.reduceVolume);
+            setStringField("rejectedVolume", dataItem.rejectedVolume);
+            setStringField("rejectedBudget", dataItem.rejectedBudget);
+
+            // Parse optional numeric fields
+            auto createdAtField = rootObj["createdAt"];
+            if (createdAtField.error() == simdjson::SUCCESS)
+            {
+                auto val = createdAtField.value();
+                if (val.type() != simdjson::ondemand::json_type::null)
+                {
+                    dataItem.createdAt = JsonHelpers::getJsonDouble(rootValue, "createdAt", 0.0);
+                }
+            }
+            auto updatedAtField = rootObj["updatedAt"];
+            if (updatedAtField.error() == simdjson::SUCCESS)
+            {
+                auto val = updatedAtField.value();
+                if (val.type() != simdjson::ondemand::json_type::null)
+                {
+                    dataItem.updatedAt = JsonHelpers::getJsonDouble(rootValue, "updatedAt", 0.0);
+                }
+            }
+            auto submittedAtField = rootObj["submittedAt"];
+            if (submittedAtField.error() == simdjson::SUCCESS)
+            {
+                auto val = submittedAtField.value();
+                if (val.type() != simdjson::ondemand::json_type::null)
+                {
+                    dataItem.submittedAt = JsonHelpers::getJsonDouble(rootValue, "submittedAt", 0.0);
+                }
+            }
+            auto dsTimeField = rootObj["dsTime"];
+            if (dsTimeField.error() == simdjson::SUCCESS)
+            {
+                auto val = dsTimeField.value();
+                if (val.type() != simdjson::ondemand::json_type::null)
+                {
+                    dataItem.dsTime = JsonHelpers::getJsonDouble(rootValue, "dsTime", 0.0);
+                }
+            }
 
             // Parse boolean field
-            if (j.contains("isCancelAll") && !j["isCancelAll"].is_null())
+            auto isCancelAllField = rootObj["isCancelAll"];
+            if (isCancelAllField.error() == simdjson::SUCCESS)
             {
-                userData.isCancelAll = JsonHelpers::getJsonBool(j, "isCancelAll");
-            }
-
-            // Parse triggerDirection (can be string or number)
-            if (j.contains("triggerDirection") && !j["triggerDirection"].is_null())
-            {
-                if (j["triggerDirection"].is_number())
+                auto val = isCancelAllField.value();
+                if (val.type() != simdjson::ondemand::json_type::null)
                 {
-                    userData.triggerDirection = j["triggerDirection"].get<double>();
-                }
-                else if (j["triggerDirection"].is_string())
-                {
-                    userData.triggerDirection = j["triggerDirection"].get<std::string>();
+                    dataItem.isCancelAll = JsonHelpers::getJsonBool(rootValue, "isCancelAll");
                 }
             }
 
-            result.userData = userData;
+            // Parse triggerDirection (can be number)
+            auto triggerDirectionField = rootObj["triggerDirection"];
+            if (triggerDirectionField.error() == simdjson::SUCCESS)
+            {
+                auto val = triggerDirectionField.value();
+                if (val.type() != simdjson::ondemand::json_type::null)
+                {
+                    if (val.type() == simdjson::ondemand::json_type::number)
+                    {
+                        auto num = val.get_double();
+                        if (num.error() == simdjson::SUCCESS)
+                        {
+                            dataItem.triggerDirection = num.value();
+                        }
+                    }
+                }
+            }
+
+            // Use pre-allocated buffer for userData object (reuse to avoid allocation)
+            auto &buffers = TpSdkCppHybrid::threadLocalBuffers_;
+            buffers.userDataBuffer.stream = stream;
+            buffers.userDataBuffer.wsTime = wsTime;
+            buffers.userDataBuffer.data = dataItem;
+
+            // Move from buffer to result
+            result.userData = std::move(buffers.userDataBuffer);
             return true;
         }
         catch (...)
@@ -560,100 +1204,153 @@ namespace margelo::nitro::cxpmobile_tpsdk
     }
 
     bool WebSocketMessageProcessor::parseKlineMessage(
-        const nlohmann::json &j,
+        simdjson::ondemand::document &doc,
         WebSocketMessageResultNitro &result)
     {
         try
         {
+            auto root = doc.get_value();
+            if (root.error() != simdjson::SUCCESS)
+            {
+                return false;
+            }
+
+            auto rootObj = root.value().get_object();
+            if (rootObj.error() != simdjson::SUCCESS)
+            {
+                return false;
+            }
+
+            auto rootValue = root.value();
+
             // CXP format: {"stream":"USDT_KDG@kline_1m","data":{...}}
-            std::string stream = JsonHelpers::getJsonString(j, "stream");
+            std::string stream = JsonHelpers::getJsonString(rootValue, "stream");
+            double wsTime = JsonHelpers::getJsonDouble(rootValue, "wsTime", 0.0);
 
             if (!stream.empty() && stream.find("@kline") != std::string::npos)
             {
-                KlineMessageData klineData;
+                std::string symbol;
+                std::string interval;
 
-                // Extract symbol from stream (e.g., "USDT_KDG@kline_1m" -> "USDT_KDG")
-                size_t atPos = stream.find('@');
-                if (atPos != std::string::npos)
+                // Extract symbol from stream using string_view for zero-copy
+                std::string_view streamView(stream);
+                size_t atPos = streamView.find('@');
+                if (atPos != std::string_view::npos)
                 {
-                    klineData.symbol = stream.substr(0, atPos);
+                    symbol.assign(streamView.data(), atPos);
                     // Extract interval (e.g., "1m" from "@kline_1m")
-                    size_t klinePos = stream.find("@kline_");
-                    if (klinePos != std::string::npos)
+                    size_t klinePos = streamView.find("@kline_");
+                    if (klinePos != std::string_view::npos)
                     {
-                        klineData.interval = stream.substr(klinePos + 7); // "@kline_" = 7 chars
+                        interval.assign(streamView.data() + klinePos + 7, streamView.length() - klinePos - 7);
                     }
-                }
-
-                // Extract wsTime if present
-                std::string wsTime = JsonHelpers::getJsonString(j, "wsTime");
-                if (!wsTime.empty())
-                {
-                    klineData.wsTime = wsTime;
                 }
 
                 // Extract data object
-                if (j.contains("data") && j["data"].is_object())
+                auto dataField = rootObj["data"];
+                if (dataField.error() == simdjson::SUCCESS)
                 {
-                    nlohmann::json dataObj = j["data"];
+                    // Get value directly from field
+                    auto dataValue = dataField.value();
 
-                    // Extract dsTime from data
-                    std::string dsTime = JsonHelpers::getJsonString(dataObj, "dsTime");
-                    if (!dsTime.empty())
+                    // Extract eventType, eventTime, symbol, dsTime from data wrapper
+                    std::string eventType = JsonHelpers::getJsonString(dataValue, "e");
+                    if (eventType.empty())
                     {
-                        klineData.timestamp = parseDouble(dsTime);
+                        eventType = "kline";
                     }
+                    double eventTime = JsonHelpers::getJsonDouble(dataValue, "E", 0.0);
+                    std::string klineSymbol = JsonHelpers::getJsonString(dataValue, "s");
+                    if (klineSymbol.empty())
+                    {
+                        klineSymbol = symbol;
+                    }
+                    double dsTime = JsonHelpers::getJsonDouble(dataValue, "dsTime", 0.0);
 
                     // CXP format has nested structure: data.k contains the kline data
                     // Format: {"data":{"k":{"t":...,"T":...,"s":"USDT_KDG","i":"1m",...},"e":"kline",...},...}
-                    if (dataObj.contains("k") && dataObj["k"].is_object())
+                    // Get k field from dataValue (which is already a value)
+                    auto dataObj = dataValue.get_object();
+                    if (dataObj.error() == simdjson::SUCCESS)
                     {
-                        nlohmann::json kObj = dataObj["k"];
-
-                        // Extract kline data from nested k object
-                        klineData.open = JsonHelpers::getJsonString(kObj, "o");
-                        klineData.high = JsonHelpers::getJsonString(kObj, "h");
-                        klineData.low = JsonHelpers::getJsonString(kObj, "l");
-                        klineData.close = JsonHelpers::getJsonString(kObj, "c");
-                        klineData.volume = JsonHelpers::getJsonString(kObj, "v");
-
-                        std::string quoteVolume = JsonHelpers::getJsonString(kObj, "q");
-                        if (!quoteVolume.empty())
+                        auto kField = dataObj["k"];
+                        if (kField.error() == simdjson::SUCCESS)
                         {
-                            klineData.quoteVolume = quoteVolume;
+                            auto kValue = kField.value();
+                            // Verify kValue is an object type
+                            if (kValue.type() == simdjson::ondemand::json_type::object)
+                            {
+                                // Use kValue directly, it's already a value
+                                simdjson::ondemand::value &kObjValue = kValue;
+
+                                // Extract kline data from nested k object with new field names
+                                double openTime = JsonHelpers::getJsonDouble(kObjValue, "t", 0.0);
+                                double closeTime = JsonHelpers::getJsonDouble(kObjValue, "T", 0.0);
+                                std::string klineSymbolFromK = JsonHelpers::getJsonString(kObjValue, "s");
+                                if (klineSymbolFromK.empty())
+                                {
+                                    klineSymbolFromK = klineSymbol;
+                                }
+                                std::string klineInterval = JsonHelpers::getJsonString(kObjValue, "i");
+                                if (klineInterval.empty())
+                                {
+                                    klineInterval = interval;
+                                }
+                                std::string firstTradeId = JsonHelpers::getJsonString(kObjValue, "f");
+                                std::string lastTradeId = JsonHelpers::getJsonString(kObjValue, "L");
+                                std::string openPrice = JsonHelpers::getJsonString(kObjValue, "o");
+                                std::string closePrice = JsonHelpers::getJsonString(kObjValue, "c");
+                                std::string highPrice = JsonHelpers::getJsonString(kObjValue, "h");
+                                std::string lowPrice = JsonHelpers::getJsonString(kObjValue, "l");
+                                std::string volume = JsonHelpers::getJsonString(kObjValue, "v");
+                                std::string quoteVolume = JsonHelpers::getJsonString(kObjValue, "q");
+                                double numberOfTrades = JsonHelpers::getJsonDouble(kObjValue, "n", 0.0);
+                                bool isClosed = JsonHelpers::getJsonBool(kObjValue, "x", false);
+                                std::string takerBuyVolume = JsonHelpers::getJsonString(kObjValue, "V");
+                                std::string takerBuyQuoteVolume = JsonHelpers::getJsonString(kObjValue, "Q");
+
+                                // Create KlineDataItem
+                                KlineDataItem klineItem;
+                                klineItem.openTime = openTime;
+                                klineItem.closeTime = closeTime;
+                                klineItem.symbol = klineSymbolFromK;
+                                klineItem.interval = klineInterval;
+                                klineItem.firstTradeId = firstTradeId;
+                                klineItem.lastTradeId = lastTradeId;
+                                klineItem.openPrice = openPrice;
+                                klineItem.closePrice = closePrice;
+                                klineItem.highPrice = highPrice;
+                                klineItem.lowPrice = lowPrice;
+                                klineItem.volume = volume;
+                                klineItem.quoteVolume = quoteVolume;
+                                klineItem.numberOfTrades = numberOfTrades;
+                                klineItem.isClosed = isClosed;
+                                klineItem.takerBuyVolume = takerBuyVolume;
+                                klineItem.takerBuyQuoteVolume = takerBuyQuoteVolume;
+
+                                // Create KlineDataWrapper
+                                KlineDataWrapper wrapper;
+                                wrapper.kline = klineItem;
+                                wrapper.eventType = eventType;
+                                wrapper.eventTime = eventTime;
+                                wrapper.symbol = klineSymbol;
+                                wrapper.dsTime = dsTime;
+
+                                // Use pre-allocated thread-local buffer for kline
+                                auto &buffers = TpSdkCppHybrid::threadLocalBuffers_;
+                                buffers.klineBuffer.data = wrapper;
+                                buffers.klineBuffer.wsTime = wsTime;
+                                buffers.klineBuffer.stream = std::move(stream);
+
+                                // Move from buffer to result
+                                result.klineData = std::move(buffers.klineBuffer);
+                                return true;
+                            }
                         }
-
-                        std::string trades = JsonHelpers::getJsonString(kObj, "n");
-                        if (!trades.empty())
-                        {
-                            klineData.trades = trades;
-                        }
-
-                        std::string openTime = JsonHelpers::getJsonString(kObj, "t");
-                        if (!openTime.empty())
-                        {
-                            klineData.openTime = openTime;
-                        }
-
-                        std::string closeTime = JsonHelpers::getJsonString(kObj, "T");
-                        if (!closeTime.empty())
-                        {
-                            klineData.closeTime = closeTime;
-                        }
-
-                        bool isClosed = JsonHelpers::getJsonBool(kObj, "x", false);
-                        klineData.isClosed = isClosed ? std::make_optional<std::string>("true") : std::nullopt;
-
-                        std::string interval = JsonHelpers::getJsonString(kObj, "i");
-                        if (!interval.empty() && klineData.interval.empty())
-                        {
-                            klineData.interval = interval;
-                        }
-
-                        result.klineData = std::move(klineData);
-                        return true;
                     }
                 }
+
+                return false;
             }
         }
         catch (...)
@@ -665,85 +1362,916 @@ namespace margelo::nitro::cxpmobile_tpsdk
         return false;
     }
 
-    // Parse depth update functions for CXP protocol
-    bool WebSocketMessageProcessor::parseDepthUpdateStream(
-        const std::string &json,
-        std::vector<OrderBookLevel> &bids,
-        std::vector<OrderBookLevel> &asks)
+    // ============================================================================
+    // Binance Format Detection and Parsing
+    // ============================================================================
+
+    bool WebSocketMessageProcessor::isBinanceFormat(simdjson::ondemand::document &doc)
     {
+        auto root = doc.get_value();
+        if (root.error() != simdjson::SUCCESS)
+        {
+            return false;
+        }
+
+        auto rootObj = root.value().get_object();
+        if (rootObj.error() != simdjson::SUCCESS)
+        {
+            return false;
+        }
+
+        auto rootValue = root.value();
+
+        // Check for Binance combined stream format FIRST: {"stream":"btcusdt@depth","data":{...}}
+        // Binance symbol format: lowercase, no underscore (e.g., "btcusdt", "ethusdt")
+        // CXP symbol format: uppercase, has underscore (e.g., "BTC_USDT", "USDT_KDG")
+        std::string stream = JsonHelpers::getJsonString(rootValue, "stream");
+        if (!stream.empty())
+        {
+            // Extract symbol from stream (part before @)
+            size_t atPos = stream.find('@');
+            if (atPos != std::string::npos)
+            {
+                std::string symbol = stream.substr(0, atPos);
+
+                // Check if symbol is Binance format (lowercase, no underscore)
+                bool hasUnderscore = (symbol.find('_') != std::string::npos);
+                bool isAllLowercase = true;
+                for (char c : symbol)
+                {
+                    if (std::isupper(c))
+                    {
+                        isAllLowercase = false;
+                        break;
+                    }
+                }
+
+                // Binance: lowercase, no underscore
+                // CXP: uppercase, has underscore
+                if (hasUnderscore || !isAllLowercase)
+                {
+                    return false; // CXP format
+                }
+
+                // Check if stream pattern matches Binance format
+                if (stream.find("@depth") != std::string::npos ||
+                    stream.find("@trade") != std::string::npos ||
+                    stream.find("@ticker") != std::string::npos ||
+                    stream.find("@kline") != std::string::npos ||
+                    stream.find("@miniTicker") != std::string::npos ||
+                    stream.find("!miniTicker@arr") != std::string::npos)
+                {
+                    return true; // Binance format
+                }
+            }
+        }
+
+        // Check symbol in "s" field for direct format: {"e":"depthUpdate","s":"BTCUSDT",...}
+        // Note: Binance "s" field is uppercase but no underscore
+        std::string symbol = JsonHelpers::getJsonString(rootValue, "s");
+        if (!symbol.empty())
+        {
+            bool hasUnderscore = (symbol.find('_') != std::string::npos);
+            if (hasUnderscore)
+            {
+                return false; // CXP format (has underscore)
+            }
+            // Binance "s" field can be uppercase (BTCUSDT) but no underscore
+            // So if no underscore, it's likely Binance
+        }
+
+        // Check for Binance direct format: {"e":"depthUpdate","s":"BTCUSDT",...}
+        std::string eventType = JsonHelpers::getJsonString(rootValue, "e");
+        if (eventType == "depthUpdate" || eventType == "trade" ||
+            eventType == "24hrTicker" || eventType == "kline" || eventType == "miniTicker")
+        {
+            // Additional check: Binance direct format usually has "s" field (symbol)
+            auto sField = rootObj["s"];
+            auto bField = rootObj["b"];
+            auto aField = rootObj["a"];
+            auto pField = rootObj["p"];
+            auto qField = rootObj["q"];
+            auto kField = rootObj["k"];
+
+            if (sField.error() == simdjson::SUCCESS || bField.error() == simdjson::SUCCESS ||
+                aField.error() == simdjson::SUCCESS || pField.error() == simdjson::SUCCESS ||
+                qField.error() == simdjson::SUCCESS || kField.error() == simdjson::SUCCESS)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    WebSocketMessageType WebSocketMessageProcessor::getBinanceStreamType(simdjson::ondemand::document &doc)
+    {
+        auto root = doc.get_value();
+        if (root.error() != simdjson::SUCCESS)
+        {
+            std::cerr << "[WebSocketMessageProcessor] getBinanceStreamType: Failed to get root value" << std::endl;
+            return WebSocketMessageType::UNKNOWN;
+        }
+
+        auto rootValue = root.value();
+        auto rootObj = root.value().get_object();
+        if (rootObj.error() != simdjson::SUCCESS)
+        {
+            std::cerr << "[WebSocketMessageProcessor] getBinanceStreamType: Failed to get root object" << std::endl;
+            return WebSocketMessageType::UNKNOWN;
+        }
+
+        // Check combined stream format first (Combined Streams API)
+        // Try to get stream field directly from object first
+        auto streamField = rootObj["stream"];
+        std::string stream;
+        if (streamField.error() == simdjson::SUCCESS)
+        {
+            auto streamValue = streamField.value();
+            auto streamStr = streamValue.get_string();
+            if (streamStr.error() == simdjson::SUCCESS)
+            {
+                // OPTIMIZATION: Direct assignment from string_view
+                std::string_view streamView(streamStr.value());
+                stream.assign(streamView.data(), streamView.length());
+            }
+        }
+        // Fallback to JsonHelpers if direct access fails
+        if (stream.empty())
+        {
+            stream = JsonHelpers::getJsonString(rootValue, "stream");
+        }
+        if (!stream.empty())
+        {
+            if (stream.find("@depth") != std::string::npos)
+        {
+            return WebSocketMessageType::DEPTH;
+        }
+            if (stream.find("@trade") != std::string::npos || stream.find("@aggTrade") != std::string::npos)
+        {
+            return WebSocketMessageType::TRADE;
+        }
+            if (stream.find("@ticker") != std::string::npos || stream.find("@miniTicker") != std::string::npos || stream.find("!miniTicker@arr") != std::string::npos)
+        {
+            return WebSocketMessageType::TICKER;
+        }
+            if (stream.find("@kline") != std::string::npos)
+        {
+            return WebSocketMessageType::KLINE;
+        }
+        }
+
+        simdjson::ondemand::value dataValue = rootValue;
+        auto dataField = rootObj["data"];
+        if (dataField.error() == simdjson::SUCCESS)
+        {
+            dataValue = dataField.value();
+        }
+
+        std::string eventType = JsonHelpers::getJsonString(dataValue, "e");
+        if (eventType.empty())
+        {
+            eventType = JsonHelpers::getJsonString(rootValue, "e");
+        }
+
+        if (eventType == "depthUpdate")
+            {
+                return WebSocketMessageType::DEPTH;
+            }
+        if (eventType == "trade")
+            {
+                return WebSocketMessageType::TRADE;
+            }
+        if (eventType == "24hrTicker" || eventType == "miniTicker")
+            {
+                return WebSocketMessageType::TICKER;
+            }
+        if (eventType == "kline")
+            {
+                return WebSocketMessageType::KLINE;
+        }
+
+        std::cerr << "[WebSocketMessageProcessor] getBinanceStreamType: Unknown type, stream=" << stream << ", eventType=" << eventType << std::endl;
+        return WebSocketMessageType::UNKNOWN;
+    }
+
+    bool WebSocketMessageProcessor::parseBinanceOrderBookMessage(
+        simdjson::ondemand::document &doc,
+        WebSocketMessageResultNitro &result)
+    {
+        // Use pre-allocated buffers to avoid reallocation
+        auto &buffers = TpSdkCppHybrid::threadLocalBuffers_;
+        buffers.depthBidsBuffer.clear();
+        buffers.depthAsksBuffer.clear();
+
+        std::vector<std::tuple<std::string, std::string>> &bids = buffers.depthBidsBuffer;
+        std::vector<std::tuple<std::string, std::string>> &asks = buffers.depthAsksBuffer;
+
+        // OPTIMIZATION: Reserve typical capacity upfront to avoid reallocation
+        bids.reserve(50);
+        asks.reserve(50);
+
+        std::string symbol;
+        bool hasBids = false;
+        bool hasAsks = false;
+
         try
         {
-            nlohmann::json j = nlohmann::json::parse(json);
-
-            // CXP format: {"e":"depthUpdate","b":[...],"a":[...]}
-            std::string eventType = JsonHelpers::getJsonString(j, "e");
-            if (eventType != "depthUpdate")
+            auto root = doc.get_value();
+            if (root.error() != simdjson::SUCCESS)
             {
                 return false;
             }
 
-            bool hasBids = false;
-            bool hasAsks = false;
-
-            if (j.contains("b") && j["b"].is_array())
+            auto rootObj = root.value().get_object();
+            if (rootObj.error() != simdjson::SUCCESS)
             {
-                hasBids = JsonHelpers::parsePriceQuantityArrayFromJson(j["b"], bids);
+                return false;
             }
 
-            if (j.contains("a") && j["a"].is_array())
+            auto rootValue = root.value();
+
+            // Check for Binance combined stream format: {"stream":"btcusdt@depth","data":{...}}
+            auto streamField = rootObj["stream"];
+            auto dataField = rootObj["data"];
+
+            // Store data object reference early to avoid invalidation
+            simdjson::ondemand::object dataObj;
+            bool hasDataObj = false;
+
+            if (streamField.error() == simdjson::SUCCESS && dataField.error() == simdjson::SUCCESS)
             {
-                hasAsks = JsonHelpers::parsePriceQuantityArrayFromJson(j["a"], asks);
+                // Get object from dataField immediately (before any other iteration)
+                auto dataObjResult = dataField.value().get_object();
+                if (dataObjResult.error() == simdjson::SUCCESS)
+                {
+                    dataObj = dataObjResult.value();
+                    hasDataObj = true;
+                }
+
+                // Extract symbol from stream
+                auto streamValue = streamField.value();
+                auto streamStr = streamValue.get_string();
+                if (streamStr.error() == simdjson::SUCCESS)
+                {
+                    // OPTIMIZATION: Direct assignment from string_view, avoid double copy
+                    std::string_view streamView(streamStr.value());
+                    size_t atPos = streamView.find('@');
+                    if (atPos != std::string_view::npos)
+                    {
+                        symbol.assign(streamView.data(), atPos); // Single copy, only what we need
+                        // Convert to uppercase (Binance uses lowercase in stream)
+                        std::transform(symbol.begin(), symbol.end(), symbol.begin(), ::toupper);
+                    }
+                }
+            }
+            // Check for Binance direct format: {"e":"depthUpdate","s":"BTCUSDT","b":[...],"a":[...]}
+            else
+            {
+                symbol = JsonHelpers::getJsonString(rootValue, "s");
             }
 
-            return hasBids || hasAsks;
+            auto bField = hasDataObj ? dataObj["b"] : rootObj["b"];
+            auto bidsField = hasDataObj ? dataObj["bids"] : rootObj["bids"];
+
+            if (bField.error() != simdjson::SUCCESS && bidsField.error() != simdjson::SUCCESS && !hasDataObj)
+            {
+                bField = rootObj["b"];
+                bidsField = rootObj["bids"];
+                }
+
+            if (bField.error() == simdjson::SUCCESS)
+            {
+                auto bValue = bField.value();
+                hasBids = JsonHelpers::extractRawStringArrayFromJson(bValue, bids);
+            }
+            else if (bidsField.error() == simdjson::SUCCESS)
+            {
+                auto bidsValue = bidsField.value();
+                hasBids = JsonHelpers::extractRawStringArrayFromJson(bidsValue, bids);
+            }
+
+            auto aField = hasDataObj ? dataObj["a"] : rootObj["a"];
+            auto asksField = hasDataObj ? dataObj["asks"] : rootObj["asks"];
+
+            if (aField.error() != simdjson::SUCCESS && asksField.error() != simdjson::SUCCESS && !hasDataObj)
+                {
+                aField = rootObj["a"];
+                asksField = rootObj["asks"];
+                }
+
+            if (aField.error() == simdjson::SUCCESS)
+            {
+                auto aValue = aField.value();
+                hasAsks = JsonHelpers::extractRawStringArrayFromJson(aValue, asks);
+            }
+            else if (asksField.error() == simdjson::SUCCESS)
+            {
+                auto asksValue = asksField.value();
+                hasAsks = JsonHelpers::extractRawStringArrayFromJson(asksValue, asks);
+            }
+
+            if (!hasBids && !hasAsks)
+            {
+                return false;
+            }
+
+            // Extract other fields
+            // Use dataObj if available, otherwise use rootValue
+            std::string eventType;
+            double eventTime = 0.0;
+            std::string firstUpdateId;
+            std::string finalUpdateId;
+
+            if (hasDataObj)
+            {
+                // Extract from dataObj (Combined Streams format) - access fields directly
+                auto eField = dataObj["e"];
+                if (eField.error() == simdjson::SUCCESS)
+            {
+                    auto eValue = eField.value();
+                    auto eStr = eValue.get_string();
+                    if (eStr.error() == simdjson::SUCCESS)
+                    {
+                        // OPTIMIZATION: Direct assignment from string_view
+                        std::string_view eView(eStr.value());
+                        eventType.assign(eView.data(), eView.length());
+                    }
+                }
+
+                auto eTimeField = dataObj["E"];
+                if (eTimeField.error() == simdjson::SUCCESS)
+                {
+                    auto eTimeValue = eTimeField.value();
+                    auto eTimeNum = eTimeValue.get_double();
+                    if (eTimeNum.error() == simdjson::SUCCESS)
+                {
+                        eventTime = eTimeNum.value();
+                }
+            }
+
+                auto uField = dataObj["U"];
+                if (uField.error() == simdjson::SUCCESS)
+                {
+                    auto uValue = uField.value();
+                    auto uStr = simdjson::to_json_string(uValue);
+                    if (uStr.error() == simdjson::SUCCESS)
+                    {
+                        // OPTIMIZATION: Direct assignment from string_view
+                        std::string_view uView(uStr.value());
+                        firstUpdateId.assign(uView.data(), uView.length());
+                    }
+                }
+
+                auto uLowerField = dataObj["u"];
+                if (uLowerField.error() == simdjson::SUCCESS)
+            {
+                    auto uLowerValue = uLowerField.value();
+                    auto uLowerStr = simdjson::to_json_string(uLowerValue);
+                    if (uLowerStr.error() == simdjson::SUCCESS)
+                    {
+                        // OPTIMIZATION: Direct assignment from string_view
+                        std::string_view uLowerView(uLowerStr.value());
+                        finalUpdateId.assign(uLowerView.data(), uLowerView.length());
+            }
+                }
+
+                // For snapshot format, lastUpdateId is used as both first and final
+                if (firstUpdateId.empty() && finalUpdateId.empty())
+                {
+                    auto lastUpdateIdField = dataObj["lastUpdateId"];
+                    if (lastUpdateIdField.error() == simdjson::SUCCESS)
+                    {
+                        auto lastUpdateIdValue = lastUpdateIdField.value();
+                        auto lastUpdateIdStr = simdjson::to_json_string(lastUpdateIdValue);
+                        if (lastUpdateIdStr.error() == simdjson::SUCCESS)
+                        {
+                            // OPTIMIZATION: Direct assignment from string_view
+                            std::string_view lastUpdateIdView(lastUpdateIdStr.value());
+                            std::string lastUpdateId;
+                            lastUpdateId.assign(lastUpdateIdView.data(), lastUpdateIdView.length());
+                            firstUpdateId = lastUpdateId;
+                            finalUpdateId = lastUpdateId;
+                        }
+                    }
+                }
+            }
+            else
+            {
+                // Extract from rootValue (direct format)
+                eventType = JsonHelpers::getJsonString(rootValue, "e");
+                eventTime = JsonHelpers::getJsonDouble(rootValue, "E", 0.0);
+                firstUpdateId = JsonHelpers::getJsonString(rootValue, "U");
+                finalUpdateId = JsonHelpers::getJsonString(rootValue, "u");
+
+                // For snapshot format, lastUpdateId is used as both first and final
+                if (firstUpdateId.empty() && finalUpdateId.empty())
+                {
+                    std::string lastUpdateId = JsonHelpers::getJsonString(rootValue, "lastUpdateId");
+                    if (!lastUpdateId.empty())
+                    {
+                        firstUpdateId = lastUpdateId;
+                        finalUpdateId = lastUpdateId;
+                    }
+                }
+            }
+
+            if (eventType.empty())
+            {
+                eventType = "depthUpdate";
+            }
+
+            double wsTime = JsonHelpers::getJsonDouble(rootValue, "wsTime", 0.0);
+            std::string stream = JsonHelpers::getJsonString(rootValue, "stream");
+
+            // Create OrderBookDataItem
+            OrderBookDataItem dataItem;
+            dataItem.eventType = eventType;
+            dataItem.eventTime = eventTime;
+            dataItem.symbol = symbol;
+            dataItem.firstUpdateId = firstUpdateId;
+            dataItem.finalUpdateId = finalUpdateId;
+            dataItem.bids = std::move(bids);
+            dataItem.asks = std::move(asks);
+            dataItem.dsTime = 0.0; // Binance doesn't have dsTime
+
+            // Create OrderBookMessageData
+            OrderBookMessageData orderBookData;
+            orderBookData.data = std::move(dataItem);
+            orderBookData.wsTime = wsTime;
+            orderBookData.stream = std::move(stream);
+
+            result.orderBookData = std::move(orderBookData);
+            result.type = WebSocketMessageType::DEPTH;
+
+            return true;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "[WebSocketMessageProcessor] parseBinanceOrderBookMessage: Exception: " << e.what() << std::endl;
+            return false;
         }
         catch (...)
         {
-            // JSON parsing failed
+            std::cerr << "[WebSocketMessageProcessor] parseBinanceOrderBookMessage: Unknown exception" << std::endl;
             return false;
         }
     }
 
-    bool WebSocketMessageProcessor::parseDepthUpdateByStream(
-        const std::string &json,
-        std::vector<OrderBookLevel> &bids,
-        std::vector<OrderBookLevel> &asks)
+    bool WebSocketMessageProcessor::parseBinanceTradeMessage(
+        simdjson::ondemand::document &doc,
+        WebSocketMessageResultNitro &result)
     {
         try
         {
-            nlohmann::json j = nlohmann::json::parse(json);
-
-            // CXP format: {"stream":"...@depth","data":{"e":"depthUpdate","b":[...],"a":[...]}}
-            std::string stream = JsonHelpers::getJsonString(j, "stream");
-            if (stream.find("@depth") == std::string::npos)
+            auto root = doc.get_value();
+            if (root.error() != simdjson::SUCCESS)
             {
                 return false;
             }
 
-            if (!j.contains("data") || !j["data"].is_object())
+            auto rootObj = root.value().get_object();
+            if (rootObj.error() != simdjson::SUCCESS)
             {
                 return false;
             }
 
-            nlohmann::json dataObj = j["data"];
-            bool hasBids = false;
-            bool hasAsks = false;
+            auto rootValue = root.value();
+            std::string stream = JsonHelpers::getJsonString(rootValue, "stream");
+            double wsTime = JsonHelpers::getJsonDouble(rootValue, "wsTime", 0.0);
+            std::string symbol;
 
-            if (dataObj.contains("b") && dataObj["b"].is_array())
+            auto dataField = rootObj["data"];
+            simdjson::ondemand::value dataValue = rootValue;
+
+            // Check for Binance combined stream format: {"stream":"btcusdt@trade","data":{...}}
+            if (dataField.error() == simdjson::SUCCESS)
             {
-                hasBids = JsonHelpers::parsePriceQuantityArrayFromJson(dataObj["b"], bids);
+                auto dataVal = dataField.value();
+                if (dataVal.type() == simdjson::ondemand::json_type::object)
+                {
+                    dataValue = dataVal;
+                }
+                else if (dataVal.type() == simdjson::ondemand::json_type::array)
+                {
+                    // Binance can send array of trades
+                    auto dataArr = dataVal.get_array();
+                    if (dataArr.error() == simdjson::SUCCESS)
+                    {
+                        auto firstElem = *dataArr.begin();
+                        if (firstElem.error() == simdjson::SUCCESS)
+                        {
+                            dataValue = firstElem.value();
+                        }
+                    }
+                }
+
+                auto streamValue = rootObj["stream"];
+                if (streamValue.error() == simdjson::SUCCESS)
+                {
+                    auto streamStr = streamValue.value().get_string();
+                    if (streamStr.error() == simdjson::SUCCESS)
+                    {
+                        // OPTIMIZATION: Use string_view for finding, then assign only what we need
+                        std::string_view streamView(streamStr.value());
+                        size_t atPos = streamView.find('@');
+                        if (atPos != std::string_view::npos)
+                        {
+                            symbol.assign(streamView.data(), atPos);
+                            std::transform(symbol.begin(), symbol.end(), symbol.begin(), ::toupper);
+                        }
+                    }
+                }
+            }
+            // Check for Binance direct format: {"e":"trade","s":"BTCUSDT",...}
+            else
+            {
+                symbol = JsonHelpers::getJsonString(rootValue, "s");
             }
 
-            if (dataObj.contains("a") && dataObj["a"].is_array())
+            // Use pre-allocated thread-local buffer for trade items
+            auto &buffers = TpSdkCppHybrid::threadLocalBuffers_;
+            buffers.tradesBuffer.clear();
+            std::vector<TradeDataItem> &tradeItems = buffers.tradesBuffer;
+            if (tradeItems.capacity() < 20)
             {
-                hasAsks = JsonHelpers::parsePriceQuantityArrayFromJson(dataObj["a"], asks);
+                tradeItems.reserve(20);
             }
 
-            return hasBids || hasAsks;
+            // Helper lambda to parse a single trade object
+            auto parseSingleTrade = [&symbol](simdjson::ondemand::value &tradeObj) -> TradeDataItem
+            {
+                TradeDataItem item;
+
+                std::string eventType = JsonHelpers::getJsonString(tradeObj, "e");
+                item.eventType = eventType.empty() ? "trade" : eventType;
+                item.eventTime = JsonHelpers::getJsonDouble(tradeObj, "E", 0.0);
+
+                std::string tradeSymbol = JsonHelpers::getJsonString(tradeObj, "s");
+                item.symbol = tradeSymbol.empty() ? symbol : tradeSymbol;
+
+                item.tradeId = JsonHelpers::getJsonString(tradeObj, "t");
+                item.price = JsonHelpers::getJsonString(tradeObj, "p");
+                item.quantity = JsonHelpers::getJsonString(tradeObj, "q");
+                item.tradeTime = JsonHelpers::getJsonDouble(tradeObj, "T", 0.0);
+                item.isBuyerMaker = JsonHelpers::getJsonBool(tradeObj, "m", false);
+
+                return item;
+            };
+
+            // Check if data is an array (multiple trades) or object (single trade)
+            if (dataField.error() == simdjson::SUCCESS)
+            {
+                auto dataVal = dataField.value();
+                if (dataVal.type() == simdjson::ondemand::json_type::array)
+                {
+                    // Array format - parse all trades
+                    auto dataArr = dataVal.get_array();
+                    if (dataArr.error() == simdjson::SUCCESS)
+                    {
+                        for (auto tradeElem : dataArr)
+                        {
+                            if (tradeElem.error() == simdjson::SUCCESS)
+                            {
+                                auto tradeObj = tradeElem.value();
+                                if (tradeObj.type() == simdjson::ondemand::json_type::object)
+                                {
+                                    tradeItems.push_back(parseSingleTrade(tradeObj));
+                                }
+                            }
+                        }
+                    }
+                }
+                else if (dataVal.type() == simdjson::ondemand::json_type::object)
+                {
+                    // Object format - single trade
+                    tradeItems.push_back(parseSingleTrade(dataVal));
+                }
+            }
+
+            if (!tradeItems.empty())
+            {
+                TradeMessageData tradeData;
+                tradeData.stream = std::move(stream);
+                tradeData.wsTime = wsTime;
+                tradeData.dsTime = 0.0;
+                tradeData.data = std::move(tradeItems);
+                result.tradeData = std::move(tradeData);
+                return true;
+            }
         }
         catch (...)
         {
-            // JSON parsing failed
+            return false;
+        }
+
+        return false;
+    }
+
+    bool WebSocketMessageProcessor::parseBinanceTickerMessage(
+        simdjson::ondemand::document &doc,
+        WebSocketMessageResultNitro &result)
+    {
+        try
+        {
+            auto root = doc.get_value();
+            if (root.error() != simdjson::SUCCESS)
+            {
+                return false;
+            }
+
+            auto rootObj = root.value().get_object();
+            if (rootObj.error() != simdjson::SUCCESS)
+            {
+                return false;
+            }
+
+            auto rootValue = root.value();
+            std::string stream = JsonHelpers::getJsonString(rootValue, "stream");
+            double wsTime = JsonHelpers::getJsonDouble(rootValue, "wsTime", 0.0);
+            std::string symbol;
+
+            auto dataField = rootObj["data"];
+            simdjson::ondemand::value dataValue = rootValue;
+
+            // Check for Binance combined stream format: {"stream":"btcusdt@ticker","data":{...}}
+            if (dataField.error() == simdjson::SUCCESS)
+            {
+                // Get value directly from field, not from object
+                auto dataVal = dataField.value();
+                dataValue = dataVal;
+
+                auto streamValue = rootObj["stream"];
+                if (streamValue.error() == simdjson::SUCCESS)
+                {
+                    auto streamStr = streamValue.value().get_string();
+                    if (streamStr.error() == simdjson::SUCCESS)
+                    {
+                        // OPTIMIZATION: Use string_view for finding, then assign only what we need
+                        std::string_view streamView(streamStr.value());
+                        size_t atPos = streamView.find('@');
+                        if (atPos != std::string_view::npos)
+                        {
+                            symbol.assign(streamView.data(), atPos);
+                            std::transform(symbol.begin(), symbol.end(), symbol.begin(), ::toupper);
+                        }
+                    }
+                }
+            }
+            // Check for Binance direct format: {"e":"24hrTicker","s":"BTCUSDT",...}
+            else
+            {
+                symbol = JsonHelpers::getJsonString(rootValue, "s");
+            }
+
+            if (dataValue.type() == simdjson::ondemand::json_type::object)
+            {
+                // Extract symbol from data if not already set
+                std::string tickerSymbol = JsonHelpers::getJsonString(dataValue, "s");
+                if (tickerSymbol.empty())
+                {
+                    tickerSymbol = symbol;
+                }
+
+                // Parse fields
+                std::string eventType = JsonHelpers::getJsonString(dataValue, "e");
+                if (eventType.empty())
+                {
+                    eventType = "24hrTicker";
+                }
+                double eventTime = JsonHelpers::getJsonDouble(dataValue, "E", 0.0);
+                std::string closePrice = JsonHelpers::getJsonString(dataValue, "c");
+                std::string openPrice = JsonHelpers::getJsonString(dataValue, "o");
+                std::string highPrice = JsonHelpers::getJsonString(dataValue, "h");
+                std::string lowPrice = JsonHelpers::getJsonString(dataValue, "l");
+                std::string volume = JsonHelpers::getJsonString(dataValue, "v");
+                std::string quoteVolume = JsonHelpers::getJsonString(dataValue, "q");
+
+                // Use pre-allocated buffer for ticker object
+                auto &buffers = TpSdkCppHybrid::threadLocalBuffers_;
+
+                // Create TickerDataItem
+                TickerDataItem dataItem;
+                dataItem.eventType = eventType;
+                dataItem.eventTime = eventTime;
+                dataItem.symbol = tickerSymbol;
+                dataItem.closePrice = closePrice;
+                dataItem.openPrice = openPrice;
+                dataItem.highPrice = highPrice;
+                dataItem.lowPrice = lowPrice;
+                dataItem.volume = volume;
+                dataItem.quoteVolume = quoteVolume;
+                dataItem.dsTime = 0.0; // Binance doesn't have dsTime
+
+                // Reuse pre-allocated ticker buffer
+                buffers.tickerBuffer.data = dataItem;
+                buffers.tickerBuffer.wsTime = wsTime;
+                buffers.tickerBuffer.stream = std::move(stream);
+
+                // Move from buffer to result
+                TickerMessageData tickerData = std::move(buffers.tickerBuffer);
+
+                result.tickerData = std::move(tickerData);
+                return true;
+            }
+        }
+        catch (...)
+        {
+            return false;
+        }
+
+        return false;
+    }
+
+    bool WebSocketMessageProcessor::parseBinanceKlineMessage(
+        simdjson::ondemand::document &doc,
+        WebSocketMessageResultNitro &result)
+    {
+        try
+        {
+            auto root = doc.get_value();
+            if (root.error() != simdjson::SUCCESS)
+            {
+                return false;
+            }
+
+            auto rootObj = root.value().get_object();
+            if (rootObj.error() != simdjson::SUCCESS)
+            {
+                return false;
+            }
+
+            auto rootValue = root.value();
+            std::string stream = JsonHelpers::getJsonString(rootValue, "stream");
+            double wsTime = JsonHelpers::getJsonDouble(rootValue, "wsTime", 0.0);
+            std::string symbol;
+            std::string interval;
+
+            auto dataField = rootObj["data"];
+            simdjson::ondemand::value dataValue = rootValue;
+
+            // Check for Binance combined stream format: {"stream":"btcusdt@kline_1m","data":{...}}
+            if (dataField.error() == simdjson::SUCCESS)
+            {
+                // Get value directly from field, not from object
+                auto dataVal = dataField.value();
+                dataValue = dataVal;
+
+                auto streamValue = rootObj["stream"];
+                if (streamValue.error() == simdjson::SUCCESS)
+                {
+                    auto streamStr = streamValue.value().get_string();
+                    if (streamStr.error() == simdjson::SUCCESS)
+                    {
+                        // OPTIMIZATION: Use string_view for finding, then assign only what we need
+                        std::string_view streamView(streamStr.value());
+                        size_t atPos = streamView.find('@');
+                        if (atPos != std::string_view::npos)
+                        {
+                            symbol.assign(streamView.data(), atPos);
+                            std::transform(symbol.begin(), symbol.end(), symbol.begin(), ::toupper);
+
+                            // Extract interval from stream (e.g., "kline_1m" -> "1m")
+                            size_t klinePos = streamView.find("@kline_");
+                            if (klinePos != std::string_view::npos)
+                            {
+                                interval.assign(streamView.data() + klinePos + 7, streamView.length() - klinePos - 7);
+                            }
+                        }
+                    }
+                }
+            }
+            // Check for Binance direct format: {"e":"kline","s":"BTCUSDT","k":{...}}
+            else
+            {
+                symbol = JsonHelpers::getJsonString(rootValue, "s");
+            }
+
+            // Extract kline object
+            simdjson::ondemand::value kValue;
+            bool hasK = false;
+
+            if (dataField.error() == simdjson::SUCCESS)
+            {
+                auto dataVal = dataField.value();
+                auto dataObj = dataVal.get_object();
+                if (dataObj.error() == simdjson::SUCCESS)
+                {
+                    auto kField = dataObj["k"];
+                    if (kField.error() == simdjson::SUCCESS)
+                    {
+                        kValue = kField.value();
+                        hasK = true;
+                    }
+                }
+            }
+
+            if (!hasK)
+            {
+                auto kField = rootObj["k"];
+                if (kField.error() == simdjson::SUCCESS)
+                {
+                    kValue = kField.value();
+                    hasK = true;
+                }
+            }
+
+            if (!hasK)
+            {
+                return false;
+            }
+
+            // kValue is already a value, use it directly
+            // Verify it's an object type
+            if (kValue.type() != simdjson::ondemand::json_type::object)
+            {
+                return false;
+            }
+
+            // Use kValue directly (it's already a value, no need to get from object)
+            simdjson::ondemand::value &kObjValue = kValue;
+
+            // Extract eventType, eventTime, symbol
+            std::string eventType = JsonHelpers::getJsonString(dataValue, "e");
+            if (eventType.empty())
+            {
+                eventType = JsonHelpers::getJsonString(rootValue, "e");
+            }
+            if (eventType.empty())
+            {
+                eventType = "kline";
+            }
+            double eventTime = JsonHelpers::getJsonDouble(dataValue, "E", 0.0);
+            if (eventTime == 0.0)
+            {
+                eventTime = JsonHelpers::getJsonDouble(rootValue, "E", 0.0);
+            }
+            std::string klineSymbol = JsonHelpers::getJsonString(kObjValue, "s");
+            if (klineSymbol.empty())
+            {
+                klineSymbol = symbol;
+            }
+            std::string klineInterval = JsonHelpers::getJsonString(kObjValue, "i");
+            if (klineInterval.empty())
+            {
+                klineInterval = interval;
+            }
+
+            // Extract kline data from k object
+            double openTime = JsonHelpers::getJsonDouble(kObjValue, "t", 0.0);
+            double closeTime = JsonHelpers::getJsonDouble(kObjValue, "T", 0.0);
+            std::string firstTradeId = JsonHelpers::getJsonString(kObjValue, "f");
+            std::string lastTradeId = JsonHelpers::getJsonString(kObjValue, "L");
+            std::string openPrice = JsonHelpers::getJsonString(kObjValue, "o");
+            std::string closePrice = JsonHelpers::getJsonString(kObjValue, "c");
+            std::string highPrice = JsonHelpers::getJsonString(kObjValue, "h");
+            std::string lowPrice = JsonHelpers::getJsonString(kObjValue, "l");
+            std::string volume = JsonHelpers::getJsonString(kObjValue, "v");
+            std::string quoteVolume = JsonHelpers::getJsonString(kObjValue, "q");
+            double numberOfTrades = JsonHelpers::getJsonDouble(kObjValue, "n", 0.0);
+            bool isClosed = JsonHelpers::getJsonBool(kObjValue, "x", false);
+            std::string takerBuyVolume = JsonHelpers::getJsonString(kObjValue, "V");
+            std::string takerBuyQuoteVolume = JsonHelpers::getJsonString(kObjValue, "Q");
+
+            // Create KlineDataItem
+            KlineDataItem klineItem;
+            klineItem.openTime = openTime;
+            klineItem.closeTime = closeTime;
+            klineItem.symbol = klineSymbol;
+            klineItem.interval = klineInterval;
+            klineItem.firstTradeId = firstTradeId;
+            klineItem.lastTradeId = lastTradeId;
+            klineItem.openPrice = openPrice;
+            klineItem.closePrice = closePrice;
+            klineItem.highPrice = highPrice;
+            klineItem.lowPrice = lowPrice;
+            klineItem.volume = volume;
+            klineItem.quoteVolume = quoteVolume;
+            klineItem.numberOfTrades = numberOfTrades;
+            klineItem.isClosed = isClosed;
+            klineItem.takerBuyVolume = takerBuyVolume;
+            klineItem.takerBuyQuoteVolume = takerBuyQuoteVolume;
+
+            // Create KlineDataWrapper
+            KlineDataWrapper wrapper;
+            wrapper.kline = klineItem;
+            wrapper.eventType = eventType;
+            wrapper.eventTime = eventTime;
+            wrapper.symbol = klineSymbol;
+            wrapper.dsTime = 0.0; // Binance doesn't have dsTime
+
+            // Use pre-allocated thread-local buffer for kline
+            auto &buffers = TpSdkCppHybrid::threadLocalBuffers_;
+            buffers.klineBuffer.data = wrapper;
+            buffers.klineBuffer.wsTime = wsTime;
+            buffers.klineBuffer.stream = std::move(stream);
+
+            // Move from buffer to result
+            result.klineData = std::move(buffers.klineBuffer);
+            return true;
+        }
+        catch (...)
+        {
             return false;
         }
     }

@@ -1,7 +1,4 @@
-import {
-  processCallbacks,
-  processCallbacksThrottled,
-} from '../shared/callbackQueue';
+import { processCallbacksThrottled } from '../shared/callbackQueue';
 import { TpSdkHybridObject } from '../shared/TpSdkInstance';
 import { kline } from './modules/kline';
 import { orderbook } from './modules/orderbook';
@@ -28,23 +25,14 @@ const initFunction = (callback?: (response: 'success' | 'fail') => void) => {
   }
 };
 
-const parseMessageFunction = (
-  messageJson: string,
-  options?: { autoProcess?: boolean; throttleMs?: number }
-) => {
+const parseMessageFunction = (messageJson: string) => {
   console.log(
     '[TpSdk] parseMessage called, message length=',
     messageJson.length
   );
   TpSdkHybridObject.processWebSocketMessage(messageJson);
-
-  if (options?.autoProcess !== false) {
-    processCallbacksThrottled();
-  }
-};
-
-const processCallbacksFunction = () => {
-  processCallbacks();
+  // Automatically process callbacks with throttling
+  processCallbacksThrottled();
 };
 
 const modules = {
@@ -56,7 +44,6 @@ const modules = {
   userData,
   init: initFunction,
   parseMessage: parseMessageFunction,
-  processCallbacks: processCallbacksFunction,
 };
 
 // Type assertion needed because we're dynamically adding TypeScript modules

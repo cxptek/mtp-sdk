@@ -1,7 +1,7 @@
 import type { HybridObject } from 'react-native-nitro-modules';
 import type {
   KlineMessageData,
-  OrderBookViewResult,
+  OrderBookMessageData,
   TickerMessageData,
   TradeMessageData,
   UserMessageData,
@@ -29,32 +29,15 @@ export interface TpSdk extends HybridObject<{ ios: 'c++'; android: 'c++' }> {
   // OrderBook Methods
   // ============================================================================
 
-  orderbookReset(): void;
-  orderbookSubscribe(callback: (data: OrderBookViewResult) => void): void;
+  orderbookSubscribe(callback: (data: OrderBookMessageData) => void): void;
   orderbookUnsubscribe(): void;
-  orderbookConfigSetAggregation(aggregationStr: string): void;
-  orderbookConfigSetDecimals(
-    baseDecimals?: number,
-    quoteDecimals?: number
-  ): void;
-  orderbookDataSetSnapshot(
-    bids: [string, string][],
-    asks: [string, string][],
-    baseDecimals?: number,
-    quoteDecimals?: number
-  ): void;
 
   // ============================================================================
   // Trades Methods
   // ============================================================================
 
-  tradesSubscribe(callback: (data: TradeMessageData) => void): void;
+  tradesSubscribe(callback: (data: TradeMessageData[]) => void): void;
   tradesUnsubscribe(): void;
-  tradesReset(): void;
-  tradesConfigSetDecimals(
-    priceDecimals?: number,
-    quantityDecimals?: number
-  ): void;
 
   // ============================================================================
   // Ticker Methods
@@ -64,7 +47,6 @@ export interface TpSdk extends HybridObject<{ ios: 'c++'; android: 'c++' }> {
   miniTickerUnsubscribe(): void;
   miniTickerPairSubscribe(callback: (data: TickerMessageData[]) => void): void;
   miniTickerPairUnsubscribe(): void;
-  tickerConfigSetDecimals(priceDecimals?: number): void;
 
   // ============================================================================
   // Kline Methods
@@ -85,21 +67,13 @@ export interface TpSdk extends HybridObject<{ ios: 'c++'; android: 'c++' }> {
 // Re-exports
 // ============================================================================
 
+export { WebSocketMessageType } from './types';
 export type {
-  DepthData,
-  DepthLevel,
   KlineMessageData,
-  OrderBookLevel,
   OrderBookMessageData,
-  OrderBookViewItem,
-  OrderBookViewResult,
   ProtocolMessageDataNitro,
-  SocketOrderBook,
   TickerMessageData,
   TradeMessageData,
-  TradeSide,
-  UpsertOrderBookResult,
   UserMessageData,
   WebSocketMessageResultNitro,
 } from './types';
-export { WebSocketMessageType } from './types';

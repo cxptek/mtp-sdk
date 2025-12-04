@@ -1,5 +1,5 @@
-import type { OrderBookViewResult } from '@cxptek/tp-sdk';
-import React, { useMemo, useLayoutEffect } from 'react';
+import type { OrderBookViewResult } from '../types';
+import React, { useMemo, useLayoutEffect, useEffect, useRef } from 'react';
 import { Dimensions, ScrollView, StyleSheet, Text, View } from 'react-native';
 import {
   Canvas,
@@ -11,6 +11,7 @@ import {
 import {
   useSharedValue,
   withTiming,
+  cancelAnimation,
   useDerivedValue,
   Easing,
 } from 'react-native-reanimated';
@@ -23,10 +24,10 @@ const BAR_HEIGHT = 14;
 const SPACING = 1;
 const MAX_ROWS = 50; // Native returns up to 50 rows
 
-// Colors
+// Colors - memoized constants to prevent recreation
 const BID_COLOR = '#0ecb81';
 const ASK_COLOR = '#f6465d';
-const BAR_OPACITY = 0.3; // Increased from 0.12 for better visibility
+const BAR_OPACITY = 0.3;
 const BEST_ROW_BG = 'rgba(14, 203, 129, 0.08)';
 const BEST_ASK_BG = 'rgba(246, 70, 93, 0.08)';
 const TEXT_PRIMARY = '#ffffff';
@@ -36,75 +37,88 @@ const BG_DARK = '#0f0f10';
 const BG_CARD = '#1a1a1b';
 const BORDER_COLOR = '#2a2e39';
 
+// Memoized gradient colors to prevent array recreation
+const BID_GRADIENT_COLORS: string[] = [
+  `rgba(14, 203, 129, ${BAR_OPACITY})`,
+  `rgba(14, 203, 129, ${BAR_OPACITY * 0.3})`,
+];
+
+const ASK_GRADIENT_COLORS: string[] = [
+  `rgba(246, 70, 93, ${BAR_OPACITY})`,
+  `rgba(246, 70, 93, ${BAR_OPACITY * 0.3})`,
+];
+
 interface OrderBookProps {
   data: OrderBookViewResult | null;
 }
 
-// Optimized single bar component for Skia canvas
-// Uses DerivedValue to compute animated x and width from SharedValue
+// FIXED: Optimized AnimatedBar - useDerivedValue is necessary for Skia reactivity
+// But we memoize all other values to prevent leaks
 const AnimatedBar: React.FC<{
   width: SharedValue<number>;
   y: number;
   isBid: boolean;
   index: number;
-}> = ({ width, y, isBid }) => {
-  // Compute x position: for bids, start from right; for asks, start from left
-  const animatedX = useDerivedValue(() => {
-    'worklet';
-    const w = Math.max(0, width.value);
-    // For bids: start from right edge, so x = COLUMN_WIDTH - width
-    // For asks: start from left edge, so x = 0
-    return isBid ? COLUMN_WIDTH - w : 0;
-  });
+}> = React.memo(
+  ({ width, y, isBid }) => {
+    // FIXED: useDerivedValue is required for Skia to react to SharedValue changes
+    // This is NOT a leak - useDerivedValue auto-cleans up on unmount
+    const animatedX = useDerivedValue(() => {
+      'worklet';
+      const w = Math.max(0, width.value);
+      // For bids: start from right edge, so x = COLUMN_WIDTH - width
+      // For asks: start from left edge, so x = 0
+      return isBid ? COLUMN_WIDTH - w : 0;
+    });
 
-  // Width animation - ensure it's always >= 0
-  const animatedWidth = useDerivedValue(() => {
-    'worklet';
-    return Math.max(0, width.value);
-  });
+    const animatedWidth = useDerivedValue(() => {
+      'worklet';
+      return Math.max(0, width.value);
+    });
 
-  // Gradient positions (fixed)
-  const startX = isBid ? COLUMN_WIDTH : 0;
-  const endX = isBid ? 0 : COLUMN_WIDTH;
+    // FIXED: Memoize vec() calls to prevent object recreation
+    const startVec = useMemo(
+      () => vec(isBid ? COLUMN_WIDTH : 0, y),
+      [isBid, y]
+    );
+    const endVec = useMemo(
+      () => vec(isBid ? 0 : COLUMN_WIDTH, y + BAR_HEIGHT),
+      [isBid, y]
+    );
 
-  return (
-    <Rect
-      x={animatedX}
-      y={y}
-      width={animatedWidth}
-      height={BAR_HEIGHT}
-      opacity={BAR_OPACITY}
-    >
-      <LinearGradient
-        start={vec(startX, y)}
-        end={vec(endX, y + BAR_HEIGHT)}
-        colors={
-          isBid
-            ? [
-                `rgba(14, 203, 129, ${BAR_OPACITY})`,
-                `rgba(14, 203, 129, ${BAR_OPACITY * 0.3})`,
-              ]
-            : [
-                `rgba(246, 70, 93, ${BAR_OPACITY})`,
-                `rgba(246, 70, 93, ${BAR_OPACITY * 0.3})`,
-              ]
-        }
-      />
-    </Rect>
-  );
-};
+    // FIXED: Use memoized gradient colors (stable reference)
+    const gradientColors = isBid ? BID_GRADIENT_COLORS : ASK_GRADIENT_COLORS;
+
+    return (
+      <Rect
+        x={animatedX}
+        y={y}
+        width={animatedWidth}
+        height={BAR_HEIGHT}
+        opacity={BAR_OPACITY}
+      >
+        <LinearGradient start={startVec} end={endVec} colors={gradientColors} />
+      </Rect>
+    );
+  },
+  (prevProps, nextProps) => {
+    // Only re-render if y position or isBid changes (width is SharedValue, Skia handles updates)
+    return (
+      prevProps.y === nextProps.y &&
+      prevProps.isBid === nextProps.isBid &&
+      prevProps.width === nextProps.width
+    );
+  }
+);
 
 AnimatedBar.displayName = 'AnimatedBar';
 
-// Optimized Canvas component - renders all bars efficiently in single Canvas
-// Much better performance than individual components
 interface BackgroundCanvasProps {
   widths: SharedValue<number>[];
   isBid: boolean;
 }
 
-// Memoize to prevent re-renders when widths array reference doesn't change
-// Skia will still detect SharedValue changes internally
+// FIXED: Memoize BackgroundCanvas to prevent re-mounting Canvas
 const BackgroundCanvas: React.FC<BackgroundCanvasProps> = React.memo(
   ({ widths, isBid }) => {
     return (
@@ -126,7 +140,7 @@ const BackgroundCanvas: React.FC<BackgroundCanvasProps> = React.memo(
       </Canvas>
     );
   },
-  // Only re-render if widths array reference changes
+  // FIXED: Strict comparison - only re-render if array reference changes
   (prevProps, nextProps) => {
     return (
       prevProps.widths === nextProps.widths &&
@@ -187,24 +201,18 @@ OrderBookRow.displayName = 'OrderBookRow';
 
 export const OrderBookAnimated: React.FC<OrderBookProps> = React.memo(
   ({ data }) => {
-    // Native returns up to MAX_ROWS (50) rows
-    // All heavy calculations moved to UI thread
+    // FIXED: Direct memoization - simpler and prevents leaks
     const bids = useMemo(() => data?.bids ?? [], [data?.bids]);
     const asks = useMemo(() => data?.asks ?? [], [data?.asks]);
+
     const maxCumulative = useMemo(
       () =>
         data?.maxCumulativeQuantity ? +data.maxCumulativeQuantity || 0 : 0,
       [data?.maxCumulativeQuantity]
     );
 
-    // Get actual number of rows from native (up to MAX_ROWS)
-    const actualRows = useMemo(
-      () => Math.min(MAX_ROWS, Math.max(bids.length, asks.length)),
-      [bids.length, asks.length]
-    );
-
-    // Pre-create all shared values - must be created at component level, not in loops
-    // Create them individually to satisfy React hooks rules
+    // FIXED: Create SharedValues once at component level - never recreate
+    // Must create individually to satisfy React hooks rules
     const bidWidth0 = useSharedValue(0);
     const bidWidth1 = useSharedValue(0);
     const bidWidth2 = useSharedValue(0);
@@ -307,227 +315,122 @@ export const OrderBookAnimated: React.FC<OrderBookProps> = React.memo(
     const askWidth48 = useSharedValue(0);
     const askWidth49 = useSharedValue(0);
 
-    const bidWidths = useMemo(
-      () => [
-        bidWidth0,
-        bidWidth1,
-        bidWidth2,
-        bidWidth3,
-        bidWidth4,
-        bidWidth5,
-        bidWidth6,
-        bidWidth7,
-        bidWidth8,
-        bidWidth9,
-        bidWidth10,
-        bidWidth11,
-        bidWidth12,
-        bidWidth13,
-        bidWidth14,
-        bidWidth15,
-        bidWidth16,
-        bidWidth17,
-        bidWidth18,
-        bidWidth19,
-        bidWidth20,
-        bidWidth21,
-        bidWidth22,
-        bidWidth23,
-        bidWidth24,
-        bidWidth25,
-        bidWidth26,
-        bidWidth27,
-        bidWidth28,
-        bidWidth29,
-        bidWidth30,
-        bidWidth31,
-        bidWidth32,
-        bidWidth33,
-        bidWidth34,
-        bidWidth35,
-        bidWidth36,
-        bidWidth37,
-        bidWidth38,
-        bidWidth39,
-        bidWidth40,
-        bidWidth41,
-        bidWidth42,
-        bidWidth43,
-        bidWidth44,
-        bidWidth45,
-        bidWidth46,
-        bidWidth47,
-        bidWidth48,
-        bidWidth49,
-      ],
-      [
-        bidWidth0,
-        bidWidth1,
-        bidWidth2,
-        bidWidth3,
-        bidWidth4,
-        bidWidth5,
-        bidWidth6,
-        bidWidth7,
-        bidWidth8,
-        bidWidth9,
-        bidWidth10,
-        bidWidth11,
-        bidWidth12,
-        bidWidth13,
-        bidWidth14,
-        bidWidth15,
-        bidWidth16,
-        bidWidth17,
-        bidWidth18,
-        bidWidth19,
-        bidWidth20,
-        bidWidth21,
-        bidWidth22,
-        bidWidth23,
-        bidWidth24,
-        bidWidth25,
-        bidWidth26,
-        bidWidth27,
-        bidWidth28,
-        bidWidth29,
-        bidWidth30,
-        bidWidth31,
-        bidWidth32,
-        bidWidth33,
-        bidWidth34,
-        bidWidth35,
-        bidWidth36,
-        bidWidth37,
-        bidWidth38,
-        bidWidth39,
-        bidWidth40,
-        bidWidth41,
-        bidWidth42,
-        bidWidth43,
-        bidWidth44,
-        bidWidth45,
-        bidWidth46,
-        bidWidth47,
-        bidWidth48,
-        bidWidth49,
-      ]
-    );
+    // FIXED: Stable array references - use ref to store once, never recreate
+    const bidWidthsRef = useRef<SharedValue<number>[]>([
+      bidWidth0,
+      bidWidth1,
+      bidWidth2,
+      bidWidth3,
+      bidWidth4,
+      bidWidth5,
+      bidWidth6,
+      bidWidth7,
+      bidWidth8,
+      bidWidth9,
+      bidWidth10,
+      bidWidth11,
+      bidWidth12,
+      bidWidth13,
+      bidWidth14,
+      bidWidth15,
+      bidWidth16,
+      bidWidth17,
+      bidWidth18,
+      bidWidth19,
+      bidWidth20,
+      bidWidth21,
+      bidWidth22,
+      bidWidth23,
+      bidWidth24,
+      bidWidth25,
+      bidWidth26,
+      bidWidth27,
+      bidWidth28,
+      bidWidth29,
+      bidWidth30,
+      bidWidth31,
+      bidWidth32,
+      bidWidth33,
+      bidWidth34,
+      bidWidth35,
+      bidWidth36,
+      bidWidth37,
+      bidWidth38,
+      bidWidth39,
+      bidWidth40,
+      bidWidth41,
+      bidWidth42,
+      bidWidth43,
+      bidWidth44,
+      bidWidth45,
+      bidWidth46,
+      bidWidth47,
+      bidWidth48,
+      bidWidth49,
+    ]);
 
-    const askWidths = useMemo(
-      () => [
-        askWidth0,
-        askWidth1,
-        askWidth2,
-        askWidth3,
-        askWidth4,
-        askWidth5,
-        askWidth6,
-        askWidth7,
-        askWidth8,
-        askWidth9,
-        askWidth10,
-        askWidth11,
-        askWidth12,
-        askWidth13,
-        askWidth14,
-        askWidth15,
-        askWidth16,
-        askWidth17,
-        askWidth18,
-        askWidth19,
-        askWidth20,
-        askWidth21,
-        askWidth22,
-        askWidth23,
-        askWidth24,
-        askWidth25,
-        askWidth26,
-        askWidth27,
-        askWidth28,
-        askWidth29,
-        askWidth30,
-        askWidth31,
-        askWidth32,
-        askWidth33,
-        askWidth34,
-        askWidth35,
-        askWidth36,
-        askWidth37,
-        askWidth38,
-        askWidth39,
-        askWidth40,
-        askWidth41,
-        askWidth42,
-        askWidth43,
-        askWidth44,
-        askWidth45,
-        askWidth46,
-        askWidth47,
-        askWidth48,
-        askWidth49,
-      ],
-      [
-        askWidth0,
-        askWidth1,
-        askWidth2,
-        askWidth3,
-        askWidth4,
-        askWidth5,
-        askWidth6,
-        askWidth7,
-        askWidth8,
-        askWidth9,
-        askWidth10,
-        askWidth11,
-        askWidth12,
-        askWidth13,
-        askWidth14,
-        askWidth15,
-        askWidth16,
-        askWidth17,
-        askWidth18,
-        askWidth19,
-        askWidth20,
-        askWidth21,
-        askWidth22,
-        askWidth23,
-        askWidth24,
-        askWidth25,
-        askWidth26,
-        askWidth27,
-        askWidth28,
-        askWidth29,
-        askWidth30,
-        askWidth31,
-        askWidth32,
-        askWidth33,
-        askWidth34,
-        askWidth35,
-        askWidth36,
-        askWidth37,
-        askWidth38,
-        askWidth39,
-        askWidth40,
-        askWidth41,
-        askWidth42,
-        askWidth43,
-        askWidth44,
-        askWidth45,
-        askWidth46,
-        askWidth47,
-        askWidth48,
-        askWidth49,
-      ]
-    );
+    const askWidthsRef = useRef<SharedValue<number>[]>([
+      askWidth0,
+      askWidth1,
+      askWidth2,
+      askWidth3,
+      askWidth4,
+      askWidth5,
+      askWidth6,
+      askWidth7,
+      askWidth8,
+      askWidth9,
+      askWidth10,
+      askWidth11,
+      askWidth12,
+      askWidth13,
+      askWidth14,
+      askWidth15,
+      askWidth16,
+      askWidth17,
+      askWidth18,
+      askWidth19,
+      askWidth20,
+      askWidth21,
+      askWidth22,
+      askWidth23,
+      askWidth24,
+      askWidth25,
+      askWidth26,
+      askWidth27,
+      askWidth28,
+      askWidth29,
+      askWidth30,
+      askWidth31,
+      askWidth32,
+      askWidth33,
+      askWidth34,
+      askWidth35,
+      askWidth36,
+      askWidth37,
+      askWidth38,
+      askWidth39,
+      askWidth40,
+      askWidth41,
+      askWidth42,
+      askWidth43,
+      askWidth44,
+      askWidth45,
+      askWidth46,
+      askWidth47,
+      askWidth48,
+      askWidth49,
+    ]);
 
-    // Update shared values when data changes - ALL calculations on UI thread
+    const bidWidths = bidWidthsRef.current;
+    const askWidths = askWidthsRef.current;
+
+    // FIXED: Update shared values with proper cleanup
     useLayoutEffect(() => {
       if (!maxCumulative || maxCumulative <= 0 || !data) {
         return;
       }
 
-      // Pass raw data to UI thread - extract and calculate everything there
       const bidsRaw = data.bids ?? [];
       const asksRaw = data.asks ?? [];
 
@@ -540,13 +443,7 @@ export const OrderBookAnimated: React.FC<OrderBookProps> = React.memo(
         };
 
         // Extract cumulativeQuantity and calculate targets all on UI thread
-        // Support all 50 rows with animation
-        const maxAnimatedRows = Math.min(
-          MAX_ROWS,
-          bidsRaw.length,
-          asksRaw.length
-        );
-        for (let i = 0; i < maxAnimatedRows; i++) {
+        for (let i = 0; i < MAX_ROWS; i++) {
           // Extract bid cumulativeQuantity and calculate target
           let bidCumQty = 0;
           if (i < bidsRaw.length) {
@@ -572,23 +469,44 @@ export const OrderBookAnimated: React.FC<OrderBookProps> = React.memo(
             maxCumulative > 0 ? (askCumQty / maxCumulative) * COLUMN_WIDTH : 0;
 
           // Only animate if value changed significantly
-          const currentBidWidth = bidWidths[i]!.value;
-          const currentAskWidth = askWidths[i]!.value;
+          const bidWidth = bidWidths[i]!;
+          const askWidth = askWidths[i]!;
 
+          const currentBidWidth = bidWidth.value;
+          const currentAskWidth = askWidth.value;
+
+          // FIXED: Cancel previous animation before starting new one
           if (Math.abs(currentBidWidth - bidTarget) > 0.1) {
-            bidWidths[i]!.value = withTiming(bidTarget, animationConfig);
+            cancelAnimation(bidWidth);
+            bidWidth.value = withTiming(bidTarget, animationConfig);
           }
           if (Math.abs(currentAskWidth - askTarget) > 0.1) {
-            askWidths[i]!.value = withTiming(askTarget, animationConfig);
+            cancelAnimation(askWidth);
+            askWidth.value = withTiming(askTarget, animationConfig);
           }
         }
       });
-      // bidWidths and askWidths are stable arrays created at component level,
-      // they don't need to be in dependencies
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [data, maxCumulative]);
 
-    1; // Prepare rows data - memoize to prevent recreation on every render
+    // FIXED: Cleanup animations on unmount
+    useEffect(() => {
+      // Capture refs in closure for cleanup
+      const bidWidthsForCleanup = bidWidths;
+      const askWidthsForCleanup = askWidths;
+
+      return () => {
+        // Cancel all active animations and reset values
+        for (let i = 0; i < MAX_ROWS; i++) {
+          cancelAnimation(bidWidthsForCleanup[i]!);
+          cancelAnimation(askWidthsForCleanup[i]!);
+          bidWidthsForCleanup[i]!.value = 0;
+          askWidthsForCleanup[i]!.value = 0;
+        }
+      };
+    }, [bidWidths, askWidths]);
+
+    // FIXED: Reuse arrays - only update when data actually changes
     const bidData = useMemo(() => {
       const rows: Array<{
         priceStr: string | null;
@@ -596,7 +514,7 @@ export const OrderBookAnimated: React.FC<OrderBookProps> = React.memo(
         key: string;
         isBestPrice: boolean;
       }> = [];
-      for (let i = 0; i < actualRows; i++) {
+      for (let i = 0; i < MAX_ROWS; i++) {
         const bid = bids[i];
         rows.push({
           priceStr: bid?.priceStr ?? null,
@@ -606,7 +524,7 @@ export const OrderBookAnimated: React.FC<OrderBookProps> = React.memo(
         });
       }
       return rows;
-    }, [bids, actualRows]);
+    }, [bids]);
 
     const askData = useMemo(() => {
       const rows: Array<{
@@ -615,7 +533,7 @@ export const OrderBookAnimated: React.FC<OrderBookProps> = React.memo(
         key: string;
         isBestPrice: boolean;
       }> = [];
-      for (let i = 0; i < actualRows; i++) {
+      for (let i = 0; i < MAX_ROWS; i++) {
         const ask = asks[i];
         rows.push({
           priceStr: ask?.priceStr ?? null,
@@ -625,10 +543,10 @@ export const OrderBookAnimated: React.FC<OrderBookProps> = React.memo(
         });
       }
       return rows;
-    }, [asks, actualRows]);
+    }, [asks]);
 
-    // Container height - calculate based on actual rows
-    const containerHeight = actualRows * (BAR_HEIGHT + SPACING);
+    // Container height - always 50 rows
+    const containerHeight = MAX_ROWS * (BAR_HEIGHT + SPACING);
 
     if (!data) {
       return (

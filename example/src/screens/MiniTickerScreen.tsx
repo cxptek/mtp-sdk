@@ -1,78 +1,130 @@
-import { useEffect, useCallback } from 'react';
-import {
-  StyleSheet,
-  View,
-  Text,
-  ScrollView,
-  TouchableOpacity,
-} from 'react-native';
+import { useEffect, useRef, useState } from 'react';
+import { StyleSheet, View, Text, ScrollView } from 'react-native';
 import { SafeAreaView, StatusBar } from 'react-native';
 import { TpSdk } from '@cxptek/tp-sdk';
 import { useTradingStore } from '../stores/useTradingStore';
-import { generateCxpId } from '../utils/cxpId';
+import { getTickerProperties } from '../types';
 
 interface MiniTickerScreenProps {
-  ws: WebSocket | null;
-  processingStats: {
-    totalProcessed: number;
-    queueProcessed: number;
-    lastMessageType: string;
-    lastProcessTime: number;
-  };
+  binanceBaseUrl: string;
+  defaultSymbol: string;
 }
 
-export function MiniTickerScreen({ ws }: MiniTickerScreenProps) {
+export function MiniTickerScreen({
+  binanceBaseUrl,
+  defaultSymbol,
+}: MiniTickerScreenProps) {
   const miniTicker = useTradingStore((state) => state.miniTicker);
   const setMiniTicker = useTradingStore((state) => state.setMiniTicker);
+  const wsRef = useRef<WebSocket | null>(null);
+  const [isConnected, setIsConnected] = useState(false);
 
-  // Subscribe to miniTicker WebSocket stream
+  // Auto-detect platform (Binance or CXP) from symbol format
+  const isCXP =
+    defaultSymbol.includes('_') &&
+    defaultSymbol === defaultSymbol.toUpperCase();
+  const platform = isCXP ? 'CXP' : 'Binance';
+
+  // WebSocket connection - supports both Binance and CXP
   useEffect(() => {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    console.log(
+      `[MiniTickerScreen] Connecting to ${platform} WebSocket:`,
+      binanceBaseUrl
+    );
 
-    try {
-      // Subscribe to miniTicker stream (single)
-      const miniTickerSubscribe = {
-        method: 'subscribe',
-        params: ['ETH_USDT@miniTicker'],
-        id: generateCxpId(),
-      };
-      ws.send(JSON.stringify(miniTickerSubscribe));
-      console.log('[MiniTickerScreen] Subscribed to ETH_USDT@miniTicker');
-    } catch (error) {
-      console.error('[MiniTickerScreen] Error subscribing:', error);
-    }
-  }, [ws]);
+    const ws = new WebSocket(binanceBaseUrl);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      console.log(`[MiniTickerScreen] ${platform} WebSocket connected`);
+      setIsConnected(true);
+
+      // Send SUBSCRIBE message for both Binance and CXP
+      // Binance: method="SUBSCRIBE", id=1 (number)
+      // CXP: method="subscribe", id="g8fur6z" (string)
+      const subscribeMessage = isCXP
+        ? {
+            method: 'subscribe',
+            params: [`${defaultSymbol}@miniTicker`],
+            id: `miniticker_${Date.now()}`,
+          }
+        : {
+            method: 'SUBSCRIBE',
+            params: [`${defaultSymbol}@miniTicker`],
+            id: 1,
+          };
+      ws.send(JSON.stringify(subscribeMessage));
+      console.log('[MiniTickerScreen] Sent SUBSCRIBE:', subscribeMessage);
+    };
+
+    ws.onmessage = (event) => {
+      if (!event.data) {
+        return;
+      }
+
+      try {
+        // Check if it's a response to SUBSCRIBE (both Binance and CXP send confirmation)
+        if (typeof event.data === 'string') {
+          const data = JSON.parse(event.data);
+          // Binance: {result: null, id: 1}
+          // CXP: {result: null, id: "g8fur6z"} or similar
+          if (
+            data.result === null &&
+            (data.id === 1 || typeof data.id === 'string')
+          ) {
+            return; // SUBSCRIBE confirmation, ignore
+          }
+        }
+
+        // SDK will auto-detect and parse format (Binance or CXP)
+        TpSdk.parseMessage(event.data);
+      } catch (error) {
+        console.error('[MiniTickerScreen] Error processing message:', error);
+      }
+    };
+
+    ws.onerror = (error) => {
+      console.error('[MiniTickerScreen] WebSocket error:', error);
+      setIsConnected(false);
+    };
+
+    ws.onclose = (event) => {
+      console.log('[MiniTickerScreen] WebSocket closed, code:', event.code);
+      setIsConnected(false);
+    };
+
+    return () => {
+      console.log('[MiniTickerScreen] Cleaning up WebSocket');
+      if (
+        ws.readyState === WebSocket.OPEN ||
+        ws.readyState === WebSocket.CONNECTING
+      ) {
+        ws.close();
+      }
+      wsRef.current = null;
+      setIsConnected(false);
+    };
+  }, [binanceBaseUrl, defaultSymbol, isCXP, platform]);
 
   // Subscribe to miniTicker updates
   useEffect(() => {
     try {
-      TpSdk.miniTicker.subscribe((data) => {
+      const subscriptionId = TpSdk.ticker.subscribe((data) => {
         setMiniTicker(data);
       });
 
       return () => {
         try {
-          TpSdk.miniTicker.unsubscribe();
+          TpSdk.ticker.unsubscribe(subscriptionId);
         } catch {
           // Ignore cleanup errors
         }
       };
     } catch {
       // Ignore initialization errors
+      return undefined;
     }
   }, [setMiniTicker]);
-
-  // Function to send fake miniTicker data
-  const sendFakeData = useCallback(() => {
-    try {
-      TpSdk.miniTicker.sendFakeData({
-        symbol: 'ETH_USDT',
-        basePrice: 3000,
-      });
-    } catch (error) {
-      console.error('Error sending fake miniTicker data:', error);
-    }
-  }, []);
 
   const formatPrice = (price: string) => {
     if (!price) return 'N/A';
@@ -87,18 +139,22 @@ export function MiniTickerScreen({ ws }: MiniTickerScreenProps) {
     return new Date(timestamp).toLocaleString();
   };
 
+  const symbolDisplay = defaultSymbol.toUpperCase().replace('USDT', '/USDT');
+
   return (
     <SafeAreaView style={styles.container}>
       <StatusBar barStyle="light-content" />
 
       <View style={styles.topHeader}>
         <View style={styles.symbolContainer}>
-          <Text style={styles.symbolText}>ETH/USDT</Text>
+          <Text style={styles.symbolText}>{symbolDisplay}</Text>
           <Text style={styles.marketTypeText}>Mini Ticker</Text>
+          {isConnected ? (
+            <View style={styles.connectedIndicator} />
+          ) : (
+            <View style={styles.disconnectedIndicator} />
+          )}
         </View>
-        <TouchableOpacity style={styles.fakeButton} onPress={sendFakeData}>
-          <Text style={styles.fakeButtonText}>Fake Data</Text>
-        </TouchableOpacity>
       </View>
 
       <ScrollView
@@ -106,95 +162,100 @@ export function MiniTickerScreen({ ws }: MiniTickerScreenProps) {
         contentContainerStyle={styles.contentContainer}
       >
         {miniTicker ? (
-          <View style={styles.tickerContainer}>
-            <View style={styles.section}>
-              <Text style={styles.sectionTitle}>Symbol</Text>
-              <Text style={styles.sectionValue}>
-                {miniTicker.symbol || 'N/A'}
-              </Text>
-            </View>
+          (() => {
+            const props = getTickerProperties(miniTicker);
+            return (
+              <View style={styles.tickerContainer}>
+                <View style={styles.section}>
+                  <Text style={styles.sectionTitle}>Symbol</Text>
+                  <Text style={styles.sectionValue}>
+                    {props.symbol || 'N/A'}
+                  </Text>
+                </View>
 
-            <View style={styles.section}>
-              <Text style={styles.sectionTitle}>Current Price</Text>
-              <Text style={[styles.sectionValue, styles.priceValue]}>
-                {formatPrice(miniTicker.currentPrice)}
-              </Text>
-            </View>
+                <View style={styles.section}>
+                  <Text style={styles.sectionTitle}>Current Price</Text>
+                  <Text style={[styles.sectionValue, styles.priceValue]}>
+                    {formatPrice(props.currentPrice)}
+                  </Text>
+                </View>
 
-            <View style={styles.priceRow}>
-              <View style={[styles.priceBox]}>
-                <Text style={styles.priceLabel}>Open Price</Text>
-                <Text style={[styles.priceValue]}>
-                  {formatPrice(miniTicker.openPrice)}
-                </Text>
+                <View style={styles.priceRow}>
+                  <View style={[styles.priceBox]}>
+                    <Text style={styles.priceLabel}>Open Price</Text>
+                    <Text style={[styles.priceValue]}>
+                      {formatPrice(props.openPrice)}
+                    </Text>
+                  </View>
+
+                  <View style={[styles.priceBox]}>
+                    <Text style={styles.priceLabel}>High Price</Text>
+                    <Text style={[styles.priceValue, styles.highPrice]}>
+                      {formatPrice(props.highPrice)}
+                    </Text>
+                  </View>
+
+                  <View style={[styles.priceBox]}>
+                    <Text style={styles.priceLabel}>Low Price</Text>
+                    <Text style={[styles.priceValue, styles.lowPrice]}>
+                      {formatPrice(props.lowPrice)}
+                    </Text>
+                  </View>
+                </View>
+
+                <View style={styles.priceRow}>
+                  <View style={[styles.priceBox]}>
+                    <Text style={styles.priceLabel}>Price Change</Text>
+                    <Text
+                      style={[
+                        styles.priceValue,
+                        parseFloat(props.priceChange || '0') >= 0
+                          ? styles.positiveChange
+                          : styles.negativeChange,
+                      ]}
+                    >
+                      {formatPrice(props.priceChange)}
+                    </Text>
+                  </View>
+
+                  <View style={[styles.priceBox]}>
+                    <Text style={styles.priceLabel}>Change %</Text>
+                    <Text
+                      style={[
+                        styles.priceValue,
+                        parseFloat(props.priceChangePercent || '0') >= 0
+                          ? styles.positiveChange
+                          : styles.negativeChange,
+                      ]}
+                    >
+                      {formatPrice(props.priceChangePercent)}%
+                    </Text>
+                  </View>
+                </View>
+
+                <View style={styles.section}>
+                  <Text style={styles.sectionTitle}>Timestamp</Text>
+                  <Text style={styles.sectionValue}>
+                    {formatTimestamp(props.timestamp)}
+                  </Text>
+                </View>
+
+                <View style={styles.section}>
+                  <Text style={styles.sectionTitle}>Raw Data</Text>
+                  <View style={styles.rawDataContainer}>
+                    <Text style={styles.rawDataText}>
+                      {JSON.stringify(miniTicker, null, 2)}
+                    </Text>
+                  </View>
+                </View>
               </View>
-
-              <View style={[styles.priceBox]}>
-                <Text style={styles.priceLabel}>High Price</Text>
-                <Text style={[styles.priceValue, styles.highPrice]}>
-                  {formatPrice(miniTicker.highPrice)}
-                </Text>
-              </View>
-
-              <View style={[styles.priceBox]}>
-                <Text style={styles.priceLabel}>Low Price</Text>
-                <Text style={[styles.priceValue, styles.lowPrice]}>
-                  {formatPrice(miniTicker.lowPrice)}
-                </Text>
-              </View>
-            </View>
-
-            <View style={styles.priceRow}>
-              <View style={[styles.priceBox]}>
-                <Text style={styles.priceLabel}>Price Change</Text>
-                <Text
-                  style={[
-                    styles.priceValue,
-                    parseFloat(miniTicker.priceChange || '0') >= 0
-                      ? styles.positiveChange
-                      : styles.negativeChange,
-                  ]}
-                >
-                  {formatPrice(miniTicker.priceChange)}
-                </Text>
-              </View>
-
-              <View style={[styles.priceBox]}>
-                <Text style={styles.priceLabel}>Change %</Text>
-                <Text
-                  style={[
-                    styles.priceValue,
-                    parseFloat(miniTicker.priceChangePercent || '0') >= 0
-                      ? styles.positiveChange
-                      : styles.negativeChange,
-                  ]}
-                >
-                  {formatPrice(miniTicker.priceChangePercent)}%
-                </Text>
-              </View>
-            </View>
-
-            <View style={styles.section}>
-              <Text style={styles.sectionTitle}>Timestamp</Text>
-              <Text style={styles.sectionValue}>
-                {formatTimestamp(miniTicker.timestamp)}
-              </Text>
-            </View>
-
-            <View style={styles.section}>
-              <Text style={styles.sectionTitle}>Raw Data</Text>
-              <View style={styles.rawDataContainer}>
-                <Text style={styles.rawDataText}>
-                  {JSON.stringify(miniTicker, null, 2)}
-                </Text>
-              </View>
-            </View>
-          </View>
+            );
+          })()
         ) : (
           <View style={styles.emptyContainer}>
             <Text style={styles.emptyText}>No mini ticker data yet...</Text>
             <Text style={styles.emptySubtext}>
-              Waiting for ETH_USDT@miniTicker stream
+              Waiting for {defaultSymbol}@miniTicker stream
             </Text>
           </View>
         )}
@@ -239,14 +300,17 @@ const styles = StyleSheet.create({
     borderRadius: 3,
     textTransform: 'uppercase',
   },
-  statsContainer: {
-    flexDirection: 'row',
-    gap: 12,
+  connectedIndicator: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#0ecb81',
   },
-  statsText: {
-    color: '#848e9c',
-    fontSize: 10,
-    fontFamily: 'monospace',
+  disconnectedIndicator: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#f6465d',
   },
   content: {
     flex: 1,
@@ -342,16 +406,5 @@ const styles = StyleSheet.create({
     color: '#5a5f6a',
     fontSize: 12,
     fontStyle: 'italic',
-  },
-  fakeButton: {
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    backgroundColor: '#f6465d',
-    borderRadius: 4,
-  },
-  fakeButtonText: {
-    color: '#ffffff',
-    fontSize: 12,
-    fontWeight: '600',
   },
 });

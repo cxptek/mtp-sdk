@@ -1,18 +1,14 @@
 #pragma once
 
-#include "json.hpp"
-#include "../nitrogen/generated/shared/c++/OrderBookLevel.hpp"
-#include "../nitrogen/generated/shared/c++/UpsertOrderBookResult.hpp"
+#include "simdjson.h"
 #include "../nitrogen/generated/shared/c++/WebSocketMessageType.hpp"
 #include "../nitrogen/generated/shared/c++/WebSocketMessageResultNitro.hpp"
 #include "../nitrogen/generated/shared/c++/OrderBookMessageData.hpp"
-#include "../nitrogen/generated/shared/c++/OrderBookViewResult.hpp"
 #include "../nitrogen/generated/shared/c++/TradeMessageData.hpp"
 #include "../nitrogen/generated/shared/c++/TickerMessageData.hpp"
 #include "../nitrogen/generated/shared/c++/KlineMessageData.hpp"
 #include "../nitrogen/generated/shared/c++/UserMessageData.hpp"
 #include "../nitrogen/generated/shared/c++/ProtocolMessageDataNitro.hpp"
-#include "../nitrogen/generated/shared/c++/TradeSide.hpp"
 #include <string>
 #include <vector>
 #include <memory>
@@ -47,48 +43,48 @@ namespace margelo::nitro::cxpmobile_tpsdk
 
     private:
         // Detect message type from parsed JSON
-        static WebSocketMessageType detectMessageType(const nlohmann::json &j);
+        static WebSocketMessageType detectMessageType(simdjson::ondemand::document &doc);
 
         // Parse different message types (populate WebSocketMessageResultNitro directly)
         static bool parseOrderBookMessage(
-            const nlohmann::json &j,
-            const std::string &json,
+            simdjson::ondemand::document &doc,
             WebSocketMessageResultNitro &result);
 
         static bool parseTradeMessage(
-            const nlohmann::json &j,
+            simdjson::ondemand::document &doc,
             WebSocketMessageResultNitro &result);
 
         static bool parseTickerMessage(
-            const nlohmann::json &j,
+            simdjson::ondemand::document &doc,
             WebSocketMessageResultNitro &result);
 
         static bool parseKlineMessage(
-            const nlohmann::json &j,
+            simdjson::ondemand::document &doc,
             WebSocketMessageResultNitro &result);
 
         static bool parseProtocolMessage(
-            const nlohmann::json &j,
+            simdjson::ondemand::document &doc,
             WebSocketMessageResultNitro &result);
 
         static bool parseUserDataMessage(
-            const nlohmann::json &j,
+            simdjson::ondemand::document &doc,
             WebSocketMessageResultNitro &result);
 
-        // Helper functions - Parse depth updates by CXP format type
-        static bool parseDepthUpdateStream(
-            const std::string &json,
-            std::vector<OrderBookLevel> &bids,
-            std::vector<OrderBookLevel> &asks);
-
-        static bool parseDepthUpdateByStream(
-            const std::string &json,
-            std::vector<OrderBookLevel> &bids,
-            std::vector<OrderBookLevel> &asks);
-
-        static bool parsePriceQuantityPairs(
-            const std::string &jsonArray,
-            std::vector<OrderBookLevel> &levels);
+        // Binance format detection and parsing
+        static bool isBinanceFormat(simdjson::ondemand::document &doc);
+        static WebSocketMessageType getBinanceStreamType(simdjson::ondemand::document &doc);
+        static bool parseBinanceOrderBookMessage(
+            simdjson::ondemand::document &doc,
+            WebSocketMessageResultNitro &result);
+        static bool parseBinanceTradeMessage(
+            simdjson::ondemand::document &doc,
+            WebSocketMessageResultNitro &result);
+        static bool parseBinanceTickerMessage(
+            simdjson::ondemand::document &doc,
+            WebSocketMessageResultNitro &result);
+        static bool parseBinanceKlineMessage(
+            simdjson::ondemand::document &doc,
+            WebSocketMessageResultNitro &result);
     };
 
 } // namespace margelo::nitro::cxpmobile_tpsdk

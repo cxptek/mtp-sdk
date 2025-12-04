@@ -12,6 +12,20 @@ add_library(${PACKAGE_NAME} SHARED
   ../cpp/TpSdkCppHybrid.cpp
   ../cpp/WebSocketMessageProcessor.cpp
   ../cpp/Utils.cpp
+  # Simdjson implementation
+  ../cpp/simdjson.cpp
+  # Core optimized components
+  ../cpp/core/SimdjsonParser.cpp
+  ../cpp/core/MemoryDebug.cpp
+  # Helpers
+  ../cpp/helpers/JsonHelpers.cpp
+  # Managers
+  ../cpp/managers/OrderBookManager.cpp
+  ../cpp/managers/TradesManager.cpp
+  ../cpp/managers/KlineManager.cpp
+  ../cpp/managers/TickerManager.cpp
+  ../cpp/managers/UserDataManager.cpp
+  ../cpp/managers/LifecycleManager.cpp
 )
 
 # Add Nitrogen specs - this will add generated sources, includes, and link libraries
@@ -22,6 +36,9 @@ include(${CMAKE_SOURCE_DIR}/../nitrogen/generated/android/cxpmobile_tpsdk+autoli
 include_directories(
   src/main/cpp
   ../cpp
+  ../cpp/core
+  ../cpp/helpers
+  ../cpp/managers
 )
 
 find_library(LOG_LIB log)

@@ -1,4 +1,4 @@
-import { useEffect, useCallback } from 'react';
+import { useEffect, useCallback, useRef, useState } from 'react';
 import {
   StyleSheet,
   View,
@@ -9,7 +9,6 @@ import {
 import { SafeAreaView, StatusBar } from 'react-native';
 import { TpSdk } from '@cxptek/tp-sdk';
 import { useTradingStore } from '../stores/useTradingStore';
-import { generateCxpId } from '../utils/cxpId';
 
 interface Trade {
   symbol: string;
@@ -20,51 +19,126 @@ interface Trade {
 }
 
 interface TradesScreenProps {
-  ws: WebSocket | null;
-  processingStats: {
-    totalProcessed: number;
-    queueProcessed: number;
-    lastMessageType: string;
-    lastProcessTime: number;
-  };
+  binanceBaseUrl: string;
+  defaultSymbol: string;
 }
 
-export function TradesScreen({ ws }: TradesScreenProps) {
+export function TradesScreen({
+  binanceBaseUrl,
+  defaultSymbol,
+}: TradesScreenProps) {
   const trades = useTradingStore((state) => state.trades);
   const addTrade = useTradingStore((state) => state.addTrade);
+  const wsRef = useRef<WebSocket | null>(null);
+  const [isConnected, setIsConnected] = useState(false);
 
-  // Subscribe to trades WebSocket stream
+  // Auto-detect platform (Binance or CXP) from symbol format
+  const isCXP =
+    defaultSymbol.includes('_') &&
+    defaultSymbol === defaultSymbol.toUpperCase();
+  const platform = isCXP ? 'CXP' : 'Binance';
+
+  // WebSocket connection - supports both Binance and CXP
   useEffect(() => {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    console.log(
+      `[TradesScreen] Connecting to ${platform} WebSocket:`,
+      binanceBaseUrl
+    );
 
-    try {
-      // Subscribe to trade stream
-      const tradeSubscribe = {
-        method: 'subscribe',
-        params: ['ETH_USDT@trade'],
-        id: generateCxpId(),
-      };
-      ws.send(JSON.stringify(tradeSubscribe));
-      console.log('[TradesScreen] Subscribed to ETH_USDT@trade');
-    } catch (error) {
-      console.error('[TradesScreen] Error subscribing:', error);
-    }
-  }, [ws]);
+    const ws = new WebSocket(binanceBaseUrl);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      console.log(`[TradesScreen] ${platform} WebSocket connected`);
+      setIsConnected(true);
+
+      // Send SUBSCRIBE message for both Binance and CXP
+      // Binance: method="SUBSCRIBE", id=1 (number)
+      // CXP: method="subscribe", id="g8fur6z" (string)
+      const subscribeMessage = isCXP
+        ? {
+            method: 'subscribe',
+            params: [`${defaultSymbol}@trade`],
+            id: `trades_${Date.now()}`,
+          }
+        : {
+            method: 'SUBSCRIBE',
+            params: [`${defaultSymbol}@trade`],
+            id: 1,
+          };
+
+      ws.send(JSON.stringify(subscribeMessage));
+      console.log('[TradesScreen] Sent SUBSCRIBE:', subscribeMessage);
+    };
+
+    ws.onmessage = (event) => {
+      if (!event.data) {
+        return;
+      }
+
+      try {
+        // Check if it's a response to SUBSCRIBE (both Binance and CXP send confirmation)
+        if (typeof event.data === 'string') {
+          const data = JSON.parse(event.data);
+          // Binance: {result: null, id: 1}
+          // CXP: {result: null, id: "g8fur6z"} or similar
+          if (
+            data.result === null &&
+            (data.id === 1 || typeof data.id === 'string')
+          ) {
+            return; // SUBSCRIBE confirmation, ignore
+          }
+        }
+
+        // SDK will auto-detect and parse format (Binance or CXP)
+        TpSdk.parseMessage(event.data);
+      } catch (error) {
+        console.error('[TradesScreen] Error processing message:', error);
+      }
+    };
+
+    ws.onerror = (error) => {
+      console.error('[TradesScreen] WebSocket error:', error);
+      setIsConnected(false);
+    };
+
+    ws.onclose = (event) => {
+      console.log('[TradesScreen] WebSocket closed, code:', event.code);
+      setIsConnected(false);
+    };
+
+    return () => {
+      console.log('[TradesScreen] Cleaning up WebSocket');
+      if (
+        ws.readyState === WebSocket.OPEN ||
+        ws.readyState === WebSocket.CONNECTING
+      ) {
+        ws.close();
+      }
+      wsRef.current = null;
+      setIsConnected(false);
+    };
+  }, [binanceBaseUrl, defaultSymbol]);
 
   // Subscribe to trades updates
   useEffect(() => {
     try {
       // Subscribe to trades
-      const subscriptionId = TpSdk.trades.subscribe((data) => {
-        const trade = {
-          symbol: data.symbol,
-          price: data.price,
-          quantity: data.quantity,
-          // TradeSide is serialized as string "buy" or "sell" in JS
-          side: (data.side === 'buy' ? 'buy' : 'sell') as const,
-          timestamp: Math.floor(data.timestamp),
-        };
-        addTrade(trade);
+      const subscriptionId = TpSdk.trades.subscribe((tradesData) => {
+        // tradesData is an array of TradeMessageData
+        tradesData.forEach((tradeData) => {
+          tradeData.data.forEach((trade) => {
+            const tradeItem = {
+              symbol: trade.symbol,
+              price: trade.price,
+              quantity: trade.quantity,
+              // TradeSide is determined by isBuyerMaker
+              side: (trade.isBuyerMaker ? 'sell' : 'buy') as const,
+              timestamp: Math.floor(trade.tradeTime),
+            };
+            addTrade(tradeItem);
+          });
+        });
       });
 
       return () => {
@@ -78,19 +152,6 @@ export function TradesScreen({ ws }: TradesScreenProps) {
       // Ignore initialization errors
     }
   }, [addTrade]);
-
-  // Function to send fake trade data
-  const sendFakeData = useCallback(() => {
-    try {
-      TpSdk.trades.sendFakeData({
-        symbol: 'ETH_USDT',
-        basePrice: 3000,
-        side: Math.random() > 0.5 ? 'buy' : 'sell',
-      });
-    } catch (error) {
-      console.error('Error sending fake trade data:', error);
-    }
-  }, []);
 
   const renderTrade = ({ item }: { item: Trade }) => (
     <View style={styles.tradeItem}>
@@ -114,18 +175,22 @@ export function TradesScreen({ ws }: TradesScreenProps) {
     </View>
   );
 
+  const symbolDisplay = defaultSymbol.toUpperCase().replace('USDT', '/USDT');
+
   return (
     <SafeAreaView style={styles.container}>
       <StatusBar barStyle="light-content" />
 
       <View style={styles.topHeader}>
         <View style={styles.symbolContainer}>
-          <Text style={styles.symbolText}>ETH/USDT</Text>
+          <Text style={styles.symbolText}>{symbolDisplay}</Text>
           <Text style={styles.marketTypeText}>Trades</Text>
+          {isConnected ? (
+            <View style={styles.connectedIndicator} />
+          ) : (
+            <View style={styles.disconnectedIndicator} />
+          )}
         </View>
-        <TouchableOpacity style={styles.fakeButton} onPress={sendFakeData}>
-          <Text style={styles.fakeButtonText}>Fake Data</Text>
-        </TouchableOpacity>
       </View>
 
       <View style={styles.tradesHeader}>
@@ -181,14 +246,17 @@ const styles = StyleSheet.create({
     borderRadius: 3,
     textTransform: 'uppercase',
   },
-  statsContainer: {
-    flexDirection: 'row',
-    gap: 12,
+  connectedIndicator: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#0ecb81',
   },
-  statsText: {
-    color: '#848e9c',
-    fontSize: 10,
-    fontFamily: 'monospace',
+  disconnectedIndicator: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#f6465d',
   },
   tradesHeader: {
     paddingHorizontal: 16,
@@ -265,16 +333,5 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     paddingVertical: 40,
     fontStyle: 'italic',
-  },
-  fakeButton: {
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    backgroundColor: '#f6465d',
-    borderRadius: 4,
-  },
-  fakeButtonText: {
-    color: '#ffffff',
-    fontSize: 12,
-    fontWeight: '600',
   },
 });

@@ -12,7 +12,6 @@
  * TpSdk.init((response) => {
  *   if (response === 'success') {
  *     // Use SDK modules
- *     TpSdk.orderbook.setAggregation('0.01');
  *     TpSdk.orderbook.subscribe((data) => { ... });
  *   }
  * });
@@ -49,10 +48,7 @@ export { userData } from './sdk/modules/userData';
 // ============================================================================
 export type {
   KlineMessageData,
-  OrderBookLevel,
   OrderBookMessageData,
-  OrderBookViewItem,
-  OrderBookViewResult,
   ProtocolMessageDataNitro,
   TickerMessageData,
   TradeMessageData,
@@ -68,13 +64,7 @@ export type { WebSocketMessageResult } from './types';
 // ============================================================================
 // Types (from types/index.ts - Extended types with 'any' fields)
 // ============================================================================
-export type {
-  DepthData,
-  DepthLevel,
-  ProtocolMessageData,
-  SocketOrderBook,
-  TradeSide,
-} from './types';
+export type { DepthData, ProtocolMessageData, TradeSide } from './types';
 
 // ============================================================================
 // Error Utilities

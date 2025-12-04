@@ -1,15 +1,19 @@
 #pragma once
 
 #include "../nitrogen/generated/shared/c++/HybridTpSdkSpec.hpp"
-#include "../nitrogen/generated/shared/c++/OrderBookLevel.hpp"
-#include "../nitrogen/generated/shared/c++/OrderBookViewResult.hpp"
-#include "../nitrogen/generated/shared/c++/OrderBookViewItem.hpp"
-#include "../nitrogen/generated/shared/c++/UpsertOrderBookResult.hpp"
 #include "Utils.hpp"
+#include "../nitrogen/generated/shared/c++/OrderBookMessageData.hpp"
 #include "../nitrogen/generated/shared/c++/TickerMessageData.hpp"
 #include "../nitrogen/generated/shared/c++/KlineMessageData.hpp"
 #include "../nitrogen/generated/shared/c++/UserMessageData.hpp"
 #include "../nitrogen/generated/shared/c++/TradeMessageData.hpp"
+// Optimized core components only
+// Optimized core components
+#include "core/DataStructs.hpp"
+#include "core/StreamProcessor.hpp"
+#include "core/SimdjsonParser.hpp"
+#include "core/DataConverter.hpp"
+#include "core/MemoryDebug.hpp"
 #include <deque>
 #include <string>
 #include <string_view>
@@ -62,10 +66,11 @@ namespace margelo::nitro::cxpmobile_tpsdk
     {
     public:
         // Forward declare nested state structs before first use
-        struct OrderBookState;
         struct TradesState;
         struct KlineState;
         struct TickerState;
+
+        // BatchState removed - no longer used with optimized processors
 
         // Default values as constants
         static constexpr int DEFAULT_ORDERBOOK_MAX_ROWS = 50;
@@ -74,10 +79,11 @@ namespace margelo::nitro::cxpmobile_tpsdk
         static constexpr int DEFAULT_ORDERBOOK_BASE_DECIMALS = 5;
         static constexpr int DEFAULT_ORDERBOOK_PRICE_DISPLAY_DECIMALS = 2;
         static constexpr const char *DEFAULT_ORDERBOOK_AGGREGATION = "0.01";
-        static constexpr size_t MAX_CALLBACK_QUEUE_SIZE = 10; // Reduced from 50 to prevent memory buildup
-        static constexpr size_t MAX_MESSAGE_QUEUE_SIZE = 20;  // Small buffer for burst messages (Zustand stores final result)
-        // Throttle orderbook callbacks to max 10 updates/second (100ms interval)
-        static constexpr std::chrono::milliseconds ORDERBOOK_THROTTLE_INTERVAL{100};
+        static constexpr size_t MAX_CALLBACK_QUEUE_SIZE = 3;                 // Reduced from 10 to prevent memory buildup
+        static constexpr size_t MAX_MESSAGE_QUEUE_SIZE = 20;                 // Small buffer for burst messages (Zustand stores final result)
+        static constexpr size_t MAX_CALLBACK_MEMORY_BYTES = 5 * 1024 * 1024; // 5MB memory limit for callback queue (reduced from 10MB)
+        // Periodic cleanup interval (10 seconds - more frequent for better memory management)
+        static constexpr std::chrono::milliseconds PERIODIC_CLEANUP_INTERVAL{10000};
 
         // Singleton pattern: Get the singleton instance
         // Returns the first instance created by Nitro
@@ -120,6 +126,15 @@ namespace margelo::nitro::cxpmobile_tpsdk
             : HybridObject(HybridTpSdkSpec::TAG), HybridTpSdkSpec(),
               isInitialized_(false)
         {
+            try
+            {
+                // Initialize optimized processors
+                initializeOptimizedProcessors();
+            }
+            catch (const std::exception &e)
+            {
+                std::cerr << "[TpSdkCppHybrid] Failed to initialize in constructor: " << e.what() << std::endl;
+            }
             try
             {
                 // Set singleton instance on first creation
@@ -205,14 +220,9 @@ namespace margelo::nitro::cxpmobile_tpsdk
             const std::string &messageJson) override;
 
         /**
-         * OrderBook methods - Stateful order book management (integrated into TpSdk)
+         * OrderBook methods - Callback management only (state handled in RN store)
          */
-        OrderBookViewResult orderbookUpsertLevel(
-            const std::vector<OrderBookLevel> &bids,
-            const std::vector<OrderBookLevel> &asks);
-        void orderbookReset() override;
-        std::variant<nitro::NullType, OrderBookViewResult> orderbookGetViewResult();
-        void orderbookSubscribe(const std::function<void(const OrderBookViewResult &)> &callback) override;
+        void orderbookSubscribe(const std::function<void(const OrderBookMessageData &)> &callback) override;
         void orderbookUnsubscribe() override;
         void miniTickerSubscribe(const std::function<void(const TickerMessageData &)> &callback) override;
         void miniTickerUnsubscribe() override;
@@ -222,72 +232,16 @@ namespace margelo::nitro::cxpmobile_tpsdk
         void klineUnsubscribe() override;
         void userDataSubscribe(const std::function<void(const UserMessageData &)> &callback) override;
         void userDataUnsubscribe() override;
-        void tradesSubscribe(const std::function<void(const TradeMessageData &)> &callback) override;
+        void tradesSubscribe(const std::function<void(const std::vector<TradeMessageData> &)> &callback) override;
         void tradesUnsubscribe() override;
-        void tradesReset() override;
 
         // Initialization methods
         bool isInitialized() override;
         // Mark as initialized (override from HybridTpSdkSpec)
         void markInitialized(const std::optional<std::function<void()>> &callback) override;
 
-        // Override methods from HybridTpSdkSpec (kept for generated interface compatibility)
-        // These methods are internal and should not be used directly - use the non-override versions below
-        void orderbookConfigSetDecimals(std::optional<double> baseDecimals, std::optional<double> quoteDecimals) override;
-        void orderbookDataSetSnapshot(
-            const std::vector<std::tuple<std::string, std::string>> &bids,
-            const std::vector<std::tuple<std::string, std::string>> &asks,
-            std::optional<double> baseDecimals,
-            std::optional<double> quoteDecimals) override;
-        void tradesConfigSetDecimals(std::optional<double> priceDecimals, std::optional<double> quantityDecimals) override;
-        void tickerConfigSetDecimals(std::optional<double> priceDecimals) override;
-
-        // Public API methods without symbol parameter (preferred - exposed to TypeScript)
-        void orderbookConfigSetAggregation(const std::string &aggregationStr);
-        void orderbookConfigSetDecimals(std::optional<int> baseDecimals, std::optional<int> quoteDecimals);
-        // Overload with 2 parameters (bids, asks) - no decimals
-        void orderbookDataSetSnapshot(
-            const std::vector<std::tuple<std::string, std::string>> &bids,
-            const std::vector<std::tuple<std::string, std::string>> &asks);
-        // Overload with 4 parameters (bids, asks, baseDecimals, quoteDecimals)
-        void orderbookDataSetSnapshot(
-            const std::vector<std::tuple<std::string, std::string>> &bids,
-            const std::vector<std::tuple<std::string, std::string>> &asks,
-            std::optional<int> baseDecimals,
-            std::optional<int> quoteDecimals);
-
-        // Config methods for other modules (not part of HybridTpSdkSpec, no symbol needed)
-        void tradesConfigSetDecimals(std::optional<int> priceDecimals, std::optional<int> quantityDecimals);
-        void tickerConfigSetDecimals(std::optional<int> priceDecimals);
-
     public:
-        // Make upsertOrderBookLevels public for WebSocketMessageProcessor
-        static std::vector<OrderBookLevel> upsertOrderBookLevels(
-            const std::vector<OrderBookLevel> &prev,
-            const std::vector<OrderBookLevel> &changes,
-            bool isBid,
-            int depthLimit);
-
-        // Optimized: Update OrderBookState map directly (in-place, O(k) instead of O(n))
-        static void upsertOrderBookLevelsToMap(
-            std::unordered_map<double, OrderBookLevel> &levelMap,
-            const std::vector<OrderBookLevel> &changes);
-
-        // Compute and cache aggregated maps in OrderBookState (O(n) when cache is dirty, O(1) when cached)
-        void computeAndCacheAggregatedMaps(
-            OrderBookState *state,
-            const std::string &aggregationStr,
-            double agg,
-            int decimals);
-
-        // Background thread processing for WebSocket messages
-        // Public to allow processors (namespace functions) to access
-        struct MessageTask
-        {
-            std::string messageJson;
-            TpSdkCppHybrid *instance; // Pointer to instance for callback access
-            // No promise needed - we return immediately, data comes via callbacks
-        };
+        // MessageTask removed - no longer used with optimized processors
 
         // Route message to appropriate queue based on message type and stream
         // Public to allow processors (namespace functions) to access
@@ -295,51 +249,71 @@ namespace margelo::nitro::cxpmobile_tpsdk
 
         // Helper: Queue callbacks
         // Public to allow processors (namespace functions) to access
-        static void queueOrderBookCallback(OrderBookViewResult viewResult, TpSdkCppHybrid *instance);
+        static void queueOrderBookCallback(OrderBookMessageData &&orderBookData, TpSdkCppHybrid *instance);
         static void queueMiniTickerCallback(TickerMessageData tickerData, TpSdkCppHybrid *instance);
         static void queueMiniTickerPairCallback(std::vector<TickerMessageData> tickerData, TpSdkCppHybrid *instance);
         static void queueKlineCallback(KlineMessageData klineData, TpSdkCppHybrid *instance);
-        static void queueTradeCallback(TradeMessageData tradeData, TpSdkCppHybrid *instance);
+        static void queueTradeCallback(std::vector<TradeMessageData> batch, TpSdkCppHybrid *instance);
+        static void queueUserDataCallback(UserMessageData userData, TpSdkCppHybrid *instance);
 
-        // Trim orderbook maps to depth limit - clear old data (keep top N bids/asks)
-        // Public to allow processors and managers to access
-        void trimOrderBookDepth(OrderBookState *state);
+        // Pre-allocated buffers for all streams (reused to avoid malloc/free)
+        // Public for MessageProcessor access
+        struct PreAllocatedBuffers
+        {
+            // Depth stream: bids/asks vectors
+            std::vector<std::tuple<std::string, std::string>> depthBidsBuffer;
+            std::vector<std::tuple<std::string, std::string>> depthAsksBuffer;
+
+            // MiniTicker stream: array of {price: number, qty: number}
+            std::vector<std::tuple<double, double>> miniTickerBuffer;
+
+            // Trades stream: array of TradeDataItem (reused, cleared each time)
+            std::vector<TradeDataItem> tradesBuffer;
+
+            // Ticker stream: object literal per pair (reused, cleared each time)
+            TickerMessageData tickerBuffer;
+
+            // MiniTicker array stream (!miniTicker@arr): array of TickerMessageData
+            std::vector<TickerMessageData> miniTickerArrayBuffer;
+
+            // Kline stream: KlineMessageData (reused, cleared each time)
+            KlineMessageData klineBuffer;
+
+            // UserData stream: orders/fills object literal (reused)
+            UserMessageData userDataBuffer;
+
+            PreAllocatedBuffers()
+            {
+                depthBidsBuffer.reserve(500);
+                depthAsksBuffer.reserve(500);
+                tradesBuffer.reserve(100);
+                miniTickerArrayBuffer.reserve(500);
+            }
+        };
+
+        // Thread-local buffers (public for WebSocketMessageProcessor access)
+        static thread_local PreAllocatedBuffers threadLocalBuffers_;
+
+        // Object pools removed - no longer used (optimized processors use core::ObjectPool)
+
+        // Optimized stream processors (new system)
+        std::unique_ptr<core::DepthProcessor> depthProcessor_;
+        std::unique_ptr<core::TradeProcessor> tradeProcessor_;
+        std::unique_ptr<core::TickerProcessor> tickerProcessor_;
+        std::unique_ptr<core::MiniTickerProcessor> miniTickerProcessor_;
+        std::unique_ptr<core::KlineProcessor> klineProcessor_;
+        std::unique_ptr<core::UserDataProcessor> userDataProcessor_;
 
     private:
-        // Internal helper methods (implementation in .cpp file)
-        static std::vector<OrderBookLevel> aggregateTopNFromLevels(
-            const std::vector<OrderBookLevel> &levels,
-            const std::string &aggregationStr,
-            bool isBid,
-            int n,
-            int buffer = 2);
-        static std::string normalizePriceKey(const std::string &price);
-        static int calculatePriceDisplayDecimals(const std::string &aggregationStr);
-
         // Callback task for async dispatch to JS thread
         struct CallbackTask
         {
             std::function<void()> callback;
         };
 
-        // Static members for background thread processing (shared across instances)
-        // 2-Thread Architecture:
-        // - orderbookQueue_: @depth stream (heavy + high frequency)
-        // - lightweightQueue_: All other streams (@trade, @kline, @miniTicker, @ticker, !miniTicker@arr, userData)
-        static std::queue<MessageTask> orderbookQueue_;
-        static std::queue<MessageTask> lightweightQueue_;
+        // Callback queue
         static std::queue<CallbackTask> callbackQueue_;
-        static std::mutex orderbookQueueMutex_;
-        static std::mutex lightweightQueueMutex_;
         static std::mutex callbackQueueMutex_;
-        static std::condition_variable orderbookQueueCondition_;
-        static std::condition_variable lightweightQueueCondition_;
-        static std::thread orderbookWorkerThread_;
-        static std::thread lightweightWorkerThread_;
-        static std::atomic<bool> orderbookWorkerRunning_;
-        static std::atomic<bool> lightweightWorkerRunning_;
-        static bool orderbookWorkerInitialized_;
-        static bool lightweightWorkerInitialized_;
 
         // Singleton instance (shared across all instances)
         static TpSdkCppHybrid *singletonInstance_;
@@ -348,17 +322,19 @@ namespace margelo::nitro::cxpmobile_tpsdk
         // Process callback queue (called from JS thread)
         void processCallbackQueue() override;
 
-        // Initialize background worker threads (2-thread architecture)
-        void initializeOrderbookWorkerThread();
-        void initializeLightweightWorkerThread();
+    private:
+        // Initialize optimized processors
+        void initializeOptimizedProcessors();
 
-        // Worker thread functions
-        static void orderbookWorkerThreadFunction();
-        static void lightweightWorkerThreadFunction();
+        // Callbacks for optimized processors
+        void onOptimizedDepthUpdate(const core::DepthData &data);
+        void onOptimizedTradeUpdate(const core::TradeData &data);
+        void onOptimizedTickerUpdate(const core::TickerData &data);
+        void onOptimizedMiniTickerUpdate(const core::MiniTickerData &data);
+        void onOptimizedKlineUpdate(const core::KlineData &data);
+        void onOptimizedUserDataUpdate(const core::UserData &data);
 
-        // Process message (called by worker threads)
-        static void processOrderbookMessage(MessageTask &task);
-        static void processLightweightMessage(MessageTask &task);
+        // Old worker thread functions removed - using optimized processors only
 
         // Transfer callbacks and state from old instance to new instance (for fast refresh)
         void transferStateFrom(TpSdkCppHybrid *oldInstance);
@@ -369,213 +345,85 @@ namespace margelo::nitro::cxpmobile_tpsdk
         // Helper: Manage callback queue size (drop old callbacks if needed)
         static void manageCallbackQueueSize(size_t dropRatio = 4);
 
+        // Periodic cleanup: Clear stale data and optimize memory
+        // Should be called periodically (e.g., every 30 seconds)
+        void performPeriodicCleanup();
+
     public:
-        // State structures for single-symbol state (direct members, no map needed)
-        struct OrderBookState
-        {
-            // Use unordered_map for efficient O(1) updates instead of O(n) vector operations
-            std::unordered_map<double, OrderBookLevel> bidsMap;
-            std::unordered_map<double, OrderBookLevel> asksMap;
-            // Cache sorted vectors (lazy conversion, marked dirty when map changes)
-            mutable std::vector<OrderBookLevel> bidsCache;
-            mutable std::vector<OrderBookLevel> asksCache;
-            mutable bool bidsCacheDirty = true;
-            mutable bool asksCacheDirty = true;
-            // Cache aggregated results to avoid recalculation (O(1) when cached)
-            mutable std::map<double, double> cachedAggregatedBids;
-            mutable std::map<double, double> cachedAggregatedAsks;
-            mutable std::string cachedAggregationStr;
-            mutable double cachedAggregationDouble = std::nan(""); // Cache parsed aggregation value
-            mutable bool aggregatedCacheDirty = true;
-
-            // Cache formatted result to avoid re-formatting (O(1) when cached)
-            mutable OrderBookViewResult cachedFormattedResult;
-            mutable bool formattedCacheDirty = true;
-            mutable int cachedBaseDecimals = -1;
-            mutable int cachedPriceDisplayDecimals = -1;
-            mutable int cachedMaxRows = -1;
-
-            std::string aggregationStr;
-            int maxRows;
-            int depthLimit; // Limit number of levels in map (clear old data when exceeded)
-            int baseDecimals;
-            int priceDisplayDecimals;
-            std::mutex mutex;
-
-            OrderBookState() : aggregationStr(DEFAULT_ORDERBOOK_AGGREGATION),
-                               maxRows(DEFAULT_ORDERBOOK_MAX_ROWS),
-                               depthLimit(DEFAULT_ORDERBOOK_DEPTH_LIMIT),
-                               baseDecimals(DEFAULT_ORDERBOOK_BASE_DECIMALS),
-                               priceDisplayDecimals(DEFAULT_ORDERBOOK_PRICE_DISPLAY_DECIMALS)
-            {
-                // Initialize cached aggregation double
-                cachedAggregationDouble = parseDouble(DEFAULT_ORDERBOOK_AGGREGATION);
-            }
-
-            // Helper to get sorted vector (lazy conversion)
-            // Bids are always sorted descending (highest price first)
-            const std::vector<OrderBookLevel> &getBidsVector() const
-            {
-                if (bidsCacheDirty)
-                {
-                    bidsCache.clear();
-                    bidsCache.reserve(bidsMap.size());
-                    for (const auto &[key, level] : bidsMap)
-                    {
-                        bidsCache.push_back(level);
-                    }
-                    std::sort(bidsCache.begin(), bidsCache.end(),
-                              [](const OrderBookLevel &a, const OrderBookLevel &b)
-                              {
-                                  return b.price > a.price; // Descending for bids
-                              });
-                    bidsCacheDirty = false;
-                }
-                // Shrink if capacity is much larger than size (e.g., > 2x)
-                else if (bidsCache.capacity() > bidsCache.size() * 2 && bidsCache.size() > 0)
-                {
-                    bidsCache.shrink_to_fit();
-                }
-                return bidsCache;
-            }
-
-            // Asks are always sorted ascending (lowest price first)
-            const std::vector<OrderBookLevel> &getAsksVector() const
-            {
-                if (asksCacheDirty)
-                {
-                    asksCache.clear();
-                    asksCache.reserve(asksMap.size());
-                    for (const auto &[key, level] : asksMap)
-                    {
-                        asksCache.push_back(level);
-                    }
-                    std::sort(asksCache.begin(), asksCache.end(),
-                              [](const OrderBookLevel &a, const OrderBookLevel &b)
-                              {
-                                  return a.price < b.price; // Ascending for asks
-                              });
-                    asksCacheDirty = false;
-                }
-                // Shrink if capacity is much larger than size (e.g., > 2x)
-                else if (asksCache.capacity() > asksCache.size() * 2 && asksCache.size() > 0)
-                {
-                    asksCache.shrink_to_fit();
-                }
-                return asksCache;
-            }
-
-            void markBidsDirty()
-            {
-                bidsCacheDirty = true;
-                aggregatedCacheDirty = true; // Invalidate aggregated cache when data changes
-                formattedCacheDirty = true;  // Invalidate formatted cache when data changes
-            }
-            void markAsksDirty()
-            {
-                asksCacheDirty = true;
-                aggregatedCacheDirty = true; // Invalidate aggregated cache when data changes
-                formattedCacheDirty = true;  // Invalidate formatted cache when data changes
-            }
-            void markAggregationDirty()
-            {
-                aggregatedCacheDirty = true; // When aggregation changes
-                formattedCacheDirty = true;  // Invalidate formatted cache when aggregation changes
-            }
-            void markDecimalsDirty()
-            {
-                formattedCacheDirty = true; // Invalidate formatted cache when decimals change
-            }
-
-            // Clear only cache data, not main data maps
-            void clearCachesOnly()
-            {
-                bidsCache.clear();
-                asksCache.clear();
-                cachedAggregatedBids.clear();
-                cachedAggregatedAsks.clear();
-                cachedFormattedResult = OrderBookViewResult(); // Reset formatted cache
-                bidsCacheDirty = true;
-                asksCacheDirty = true;
-                aggregatedCacheDirty = true;
-                formattedCacheDirty = true;
-                cachedBaseDecimals = -1;
-                cachedPriceDisplayDecimals = -1;
-                cachedMaxRows = -1;
-                // Shrink vectors to free memory
-                bidsCache.shrink_to_fit();
-                asksCache.shrink_to_fit();
-                // Note: cachedAggregatedBids and cachedAggregatedAsks are std::map, not std::vector
-                // std::map doesn't have shrink_to_fit(), but clear() already releases memory
-            }
-
-            // Shrink cache vectors to reduce memory footprint
-            void shrinkCaches()
-            {
-                bidsCache.shrink_to_fit();
-                asksCache.shrink_to_fit();
-                // Note: cachedAggregatedBids and cachedAggregatedAsks are std::map, not std::vector
-                // std::map doesn't have shrink_to_fit(), but clear() already releases memory
-            }
-
-            void clear()
-            {
-                bidsMap.clear();
-                asksMap.clear();
-                bidsCache.clear();
-                asksCache.clear();
-                cachedAggregatedBids.clear();
-                cachedAggregatedAsks.clear();
-                cachedFormattedResult = OrderBookViewResult(); // Reset formatted cache
-                bidsCacheDirty = true;
-                asksCacheDirty = true;
-                aggregatedCacheDirty = true;
-                formattedCacheDirty = true;
-                cachedBaseDecimals = -1;
-                cachedPriceDisplayDecimals = -1;
-                cachedMaxRows = -1;
-                // Shrink vectors to free memory
-                bidsCache.shrink_to_fit();
-                asksCache.shrink_to_fit();
-                // Note: cachedAggregatedBids and cachedAggregatedAsks are std::map, not std::vector
-                // std::map doesn't have shrink_to_fit(), but clear() already releases memory
-            }
-        };
-
         struct TradesState
         {
             std::deque<TradeMessageData> queue;
             int maxRows;
-            int priceDecimals;
-            int quantityDecimals;
             std::mutex mutex;
 
+            // Batch state for adaptive batching
+            std::deque<TradeMessageData> pendingTrades;
+            std::chrono::steady_clock::time_point lastFlushTime;
+            static constexpr size_t MAX_BATCH_SIZE = 10;
+            static constexpr int BATCH_TIMEOUT_MS = 20;
+            static constexpr size_t BURST_THRESHOLD = 50;
+            static constexpr int PENDING_TRADES_TIMEOUT_MS = 5000; // Clear pending trades if not flushed for 5 seconds
+
             TradesState() : maxRows(DEFAULT_TRADES_MAX_ROWS),
-                            priceDecimals(2),
-                            quantityDecimals(8) {}
-            
+                            lastFlushTime(std::chrono::steady_clock::now()) {}
+
             // Optimize memory by rebuilding queue if it has grown too large
             // std::deque doesn't have shrink_to_fit, so we rebuild if capacity is excessive
             void optimizeMemory()
             {
-                // If queue is much smaller than maxRows, rebuild it to reduce memory
-                // This is a heuristic - deque doesn't expose capacity, so we check size
-                // Rebuild if we've recently trimmed and size is small compared to maxRows
+                // Rebuild queue if it's much smaller than maxRows to reduce memory
                 if (queue.size() < static_cast<size_t>(maxRows) / 2 && queue.size() > 0)
                 {
                     std::deque<TradeMessageData> newQueue;
                     // Move elements to new deque to potentially reduce internal fragmentation
-                    for (auto& item : queue)
+                    for (auto &item : queue)
                     {
                         newQueue.push_back(std::move(item));
                     }
                     queue = std::move(newQueue);
                 }
+
+                // Also optimize pendingTrades if it has grown too large
+                if (pendingTrades.size() > MAX_BATCH_SIZE * 2 && pendingTrades.size() > 0)
+                {
+                    std::deque<TradeMessageData> newPending;
+                    // Keep only recent items (last MAX_BATCH_SIZE * 2)
+                    size_t keepCount = std::min(pendingTrades.size(), static_cast<size_t>(MAX_BATCH_SIZE * 2));
+                    auto startIt = pendingTrades.end() - keepCount;
+                    for (auto it = startIt; it != pendingTrades.end(); ++it)
+                    {
+                        newPending.push_back(std::move(*it));
+                    }
+                    pendingTrades = std::move(newPending);
+                }
             }
-            
+
+            // Check and clear stale pending trades (not flushed for too long)
+            bool clearStalePendingTrades()
+            {
+                if (pendingTrades.empty())
+                {
+                    return false;
+                }
+
+                auto now = std::chrono::steady_clock::now();
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastFlushTime).count();
+
+                if (elapsed >= PENDING_TRADES_TIMEOUT_MS)
+                {
+                    pendingTrades.clear();
+                    lastFlushTime = now;
+                    return true;
+                }
+
+                return false;
+            }
+
             void clear()
             {
                 queue.clear();
+                pendingTrades.clear();
+                lastFlushTime = std::chrono::steady_clock::now();
                 // After clear, deque should release memory, but we can't force it
                 // The destructor will handle it
             }
@@ -585,9 +433,10 @@ namespace margelo::nitro::cxpmobile_tpsdk
         {
             std::unordered_map<std::string, KlineMessageData> data; // interval -> kline data
             std::mutex mutex;
+            static constexpr size_t MAX_INTERVALS = 20; // Limit number of intervals to prevent unlimited growth
 
             KlineState() {}
-            
+
             // Optimize memory by rehashing if map has many empty buckets
             void optimizeMemory()
             {
@@ -598,7 +447,25 @@ namespace margelo::nitro::cxpmobile_tpsdk
                     data.rehash(data.size()); // Rehash to fit current size
                 }
             }
-            
+
+            // Trim old intervals if exceeding limit (keep most recent)
+            void trimToLimit()
+            {
+                if (data.size() > MAX_INTERVALS)
+                {
+                    // Remove oldest entries (simple approach: remove first N entries)
+                    // In practice, we keep the most recent intervals
+                    size_t removeCount = data.size() - MAX_INTERVALS;
+                    auto it = data.begin();
+                    for (size_t i = 0; i < removeCount && it != data.end(); ++i)
+                    {
+                        it = data.erase(it);
+                    }
+                    // Rehash after removal to free memory
+                    data.rehash(data.size());
+                }
+            }
+
             void clear()
             {
                 data.clear();
@@ -610,21 +477,21 @@ namespace margelo::nitro::cxpmobile_tpsdk
         struct TickerState
         {
             TickerMessageData data;
-            int priceDecimals;
             std::mutex mutex;
 
-            TickerState() : priceDecimals(2) {}
+            TickerState() {}
         };
 
         // Single-symbol state (direct members, no map needed)
-        OrderBookState orderBookState_;
+        // Note: OrderBookState removed - state is now handled in RN store
         TradesState tradesState_;
         KlineState klineState_;
         TickerState tickerState_;
 
         // Subscription callbacks and mutexes
         // Note: This is internal SDK implementation, not exposed to external API
-        std::function<void(const OrderBookViewResult &)> orderBookCallback_;
+        // Orderbook callback - receives OrderBookMessageData with all fields from socket message
+        std::function<void(const OrderBookMessageData &)> orderBookCallback_;
         std::mutex orderBookCallbackMutex_;
 
         std::function<void(const TickerMessageData &)> miniTickerCallback_;
@@ -639,47 +506,16 @@ namespace margelo::nitro::cxpmobile_tpsdk
         std::function<void(const UserMessageData &)> userDataCallback_;
         std::mutex userDataCallbackMutex_;
 
-        std::function<void(const TradeMessageData &)> tradesCallback_;
+        std::function<void(const std::vector<TradeMessageData> &)> tradesCallback_;
         std::mutex tradesCallbackMutex_;
 
         // Global all tickers state (for !miniTicker@arr)
         std::vector<TickerMessageData> allTickersData_;
         std::mutex allTickersMutex_;
 
-        // OrderBook callback throttling state
-        struct OrderBookCallbackState {
-            std::chrono::steady_clock::time_point lastCallbackTime;
-            OrderBookViewResult lastQueuedResult;
-            bool hasLastResult = false;
-            std::mutex mutex;
-        };
-        OrderBookCallbackState orderBookCallbackState_;
-
         // Initialization state
         std::atomic<bool> isInitialized_;
         std::mutex initializationMutex_;
-
-        // OrderBook helper methods
-        OrderBookViewResult formatOrderBookView(
-            const std::vector<OrderBookLevel> &bids,
-            const std::vector<OrderBookLevel> &asks);
-
-        // Overloaded version with explicit parameters (avoids instance variable workaround)
-        OrderBookViewResult formatOrderBookView(
-            const std::vector<OrderBookLevel> &bids,
-            const std::vector<OrderBookLevel> &asks,
-            const std::string &aggregationStr,
-            int baseDecimals,
-            int priceDisplayDecimals,
-            int maxRows);
-
-        // Optimized version: Accept pre-aggregated maps to avoid recalculation (O(1) when using cache)
-        OrderBookViewResult formatOrderBookViewFromAggregatedMaps(
-            const std::map<double, double> &aggregatedBids,
-            const std::map<double, double> &aggregatedAsks,
-            int baseDecimals,
-            int priceDisplayDecimals,
-            int maxRows);
 
     private:
         // Private members (if any)

@@ -9,14 +9,11 @@
 namespace margelo::nitro::cxpmobile_tpsdk
 {
     class TpSdkCppHybrid;
-    
+
     namespace TradesManager
     {
         // Legacy trades methods (deprecated, use symbol-scoped methods)
-        void tradesSubscribe(TpSdkCppHybrid* instance, const std::function<void(const TradeMessageData &)> &callback);
-        void tradesUnsubscribe(TpSdkCppHybrid* instance);
-        void tradesReset(TpSdkCppHybrid* instance);
-        void tradesConfigSetDecimals(TpSdkCppHybrid* instance, std::optional<int> priceDecimals, std::optional<int> quantityDecimals);
+        void tradesSubscribe(TpSdkCppHybrid *instance, const std::function<void(const std::vector<TradeMessageData> &)> &callback);
+        void tradesUnsubscribe(TpSdkCppHybrid *instance);
     }
 }
-

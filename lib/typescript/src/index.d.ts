@@ -12,7 +12,6 @@
  * TpSdk.init((response) => {
  *   if (response === 'success') {
  *     // Use SDK modules
- *     TpSdk.orderbook.setAggregation('0.01');
  *     TpSdk.orderbook.subscribe((data) => { ... });
  *   }
  * });
@@ -28,9 +27,9 @@ export { ticker } from './sdk/modules/ticker';
 export { tickerAll } from './sdk/modules/tickerAll';
 export { trades } from './sdk/modules/trades';
 export { userData } from './sdk/modules/userData';
-export type { KlineMessageData, OrderBookLevel, OrderBookMessageData, OrderBookViewItem, OrderBookViewResult, ProtocolMessageDataNitro, TickerMessageData, TradeMessageData, UserMessageData, WebSocketMessageType, } from './TpSdk.nitro';
+export type { KlineMessageData, OrderBookMessageData, ProtocolMessageDataNitro, TickerMessageData, TradeMessageData, UserMessageData, WebSocketMessageType, } from './TpSdk.nitro';
 export type { WebSocketMessageResult } from './types';
-export type { DepthData, DepthLevel, ProtocolMessageData, SocketOrderBook, TradeSide, } from './types';
+export type { DepthData, ProtocolMessageData, TradeSide } from './types';
 export { createSdkError, createSdkErrorWithCode, SdkErrorCode, } from './shared/errors';
 export type { SdkErrorOptions } from './shared/errors';
 //# sourceMappingURL=index.d.ts.map

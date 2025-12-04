@@ -17,8 +17,17 @@ namespace margelo::nitro::cxpmobile_tpsdk
         {
             if (instance != nullptr)
             {
+                // Clear callback first
+                {
                 std::lock_guard<std::mutex> lock(instance->klineCallbackMutex_);
                 instance->klineCallback_ = nullptr;
+                }
+                
+                // Clear all kline data when unsubscribing
+                {
+                    std::lock_guard<std::mutex> lock(instance->klineState_.mutex);
+                    instance->klineState_.clear();
+                }
             }
         }
     }

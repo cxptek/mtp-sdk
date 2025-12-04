@@ -35,31 +35,7 @@ namespace margelo::nitro::cxpmobile_tpsdk
                 // Note: Cannot copy structs directly because they contain std::mutex (non-copyable)
                 // Must copy data members manually, excluding mutex
                 {
-                    std::lock_guard<std::mutex> oldLock(oldInstance->orderBookState_.mutex);
-                    std::lock_guard<std::mutex> newLock(newInstance->orderBookState_.mutex);
-                    // Copy all data members except mutex
-                    newInstance->orderBookState_.bidsMap = oldInstance->orderBookState_.bidsMap;
-                    newInstance->orderBookState_.asksMap = oldInstance->orderBookState_.asksMap;
-                    newInstance->orderBookState_.bidsCache = oldInstance->orderBookState_.bidsCache;
-                    newInstance->orderBookState_.asksCache = oldInstance->orderBookState_.asksCache;
-                    newInstance->orderBookState_.bidsCacheDirty = oldInstance->orderBookState_.bidsCacheDirty;
-                    newInstance->orderBookState_.asksCacheDirty = oldInstance->orderBookState_.asksCacheDirty;
-                    newInstance->orderBookState_.cachedAggregatedBids = oldInstance->orderBookState_.cachedAggregatedBids;
-                    newInstance->orderBookState_.cachedAggregatedAsks = oldInstance->orderBookState_.cachedAggregatedAsks;
-                    newInstance->orderBookState_.cachedAggregationStr = oldInstance->orderBookState_.cachedAggregationStr;
-                    newInstance->orderBookState_.cachedAggregationDouble = oldInstance->orderBookState_.cachedAggregationDouble;
-                    newInstance->orderBookState_.aggregatedCacheDirty = oldInstance->orderBookState_.aggregatedCacheDirty;
-                    newInstance->orderBookState_.cachedFormattedResult = oldInstance->orderBookState_.cachedFormattedResult;
-                    newInstance->orderBookState_.formattedCacheDirty = oldInstance->orderBookState_.formattedCacheDirty;
-                    newInstance->orderBookState_.cachedBaseDecimals = oldInstance->orderBookState_.cachedBaseDecimals;
-                    newInstance->orderBookState_.cachedPriceDisplayDecimals = oldInstance->orderBookState_.cachedPriceDisplayDecimals;
-                    newInstance->orderBookState_.cachedMaxRows = oldInstance->orderBookState_.cachedMaxRows;
-                    newInstance->orderBookState_.aggregationStr = oldInstance->orderBookState_.aggregationStr;
-                    newInstance->orderBookState_.maxRows = oldInstance->orderBookState_.maxRows;
-                    newInstance->orderBookState_.depthLimit = oldInstance->orderBookState_.depthLimit;
-                    newInstance->orderBookState_.baseDecimals = oldInstance->orderBookState_.baseDecimals;
-                    newInstance->orderBookState_.priceDisplayDecimals = oldInstance->orderBookState_.priceDisplayDecimals;
-                    // mutex is not copied - new instance has its own mutex
+                    // OrderBook state is now handled in RN store, no copying needed
                 }
 
                 {
@@ -68,8 +44,6 @@ namespace margelo::nitro::cxpmobile_tpsdk
                     // Copy all data members except mutex
                     newInstance->tradesState_.queue = oldInstance->tradesState_.queue;
                     newInstance->tradesState_.maxRows = oldInstance->tradesState_.maxRows;
-                    newInstance->tradesState_.priceDecimals = oldInstance->tradesState_.priceDecimals;
-                    newInstance->tradesState_.quantityDecimals = oldInstance->tradesState_.quantityDecimals;
                     // mutex is not copied - new instance has its own mutex
                 }
 
@@ -86,7 +60,6 @@ namespace margelo::nitro::cxpmobile_tpsdk
                     std::lock_guard<std::mutex> newLock(newInstance->tickerState_.mutex);
                     // Copy all data members except mutex
                     newInstance->tickerState_.data = oldInstance->tickerState_.data;
-                    newInstance->tickerState_.priceDecimals = oldInstance->tickerState_.priceDecimals;
                     // mutex is not copied - new instance has its own mutex
                 }
 
@@ -153,8 +126,7 @@ namespace margelo::nitro::cxpmobile_tpsdk
             {
                 // Clear all data in old instance
                 {
-                    std::lock_guard<std::mutex> lock(oldInstance->orderBookState_.mutex);
-                    oldInstance->orderBookState_.clear();
+                    // OrderBook state is now handled in RN store, no cleanup needed
                 }
 
                 {

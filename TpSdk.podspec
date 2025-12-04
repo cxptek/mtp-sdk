@@ -16,7 +16,7 @@ Pod::Spec.new do |s|
   s.source_files = [
     "ios/**/*.{m,mm}",
     "ios/**/*.{h}",
-    "cpp/**/*.{hpp,cpp}",
+    "cpp/**/*.{h,hpp,cpp}",
   ]
 
   s.pod_target_xcconfig = {

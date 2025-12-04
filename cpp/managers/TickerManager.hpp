@@ -18,7 +18,6 @@ namespace margelo::nitro::cxpmobile_tpsdk
         void miniTickerUnsubscribe(TpSdkCppHybrid* instance);
         void miniTickerPairSubscribe(TpSdkCppHybrid* instance, const std::function<void(const std::vector<TickerMessageData> &)> &callback);
         void miniTickerPairUnsubscribe(TpSdkCppHybrid* instance);
-        void tickerConfigSetDecimals(TpSdkCppHybrid* instance, std::optional<int> priceDecimals);
     }
 }
 

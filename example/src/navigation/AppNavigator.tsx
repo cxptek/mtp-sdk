@@ -10,16 +10,14 @@ import { KlineScreen } from '../screens/KlineScreen';
 const Tab = createBottomTabNavigator();
 
 interface AppNavigatorProps {
-  ws: WebSocket | null;
-  processingStats: {
-    totalProcessed: number;
-    queueProcessed: number;
-    lastMessageType: string;
-    lastProcessTime: number;
-  };
+  binanceBaseUrl: string;
+  defaultSymbol: string;
 }
 
-export function AppNavigator({ ws, processingStats }: AppNavigatorProps) {
+export function AppNavigator({
+  binanceBaseUrl,
+  defaultSymbol,
+}: AppNavigatorProps) {
   return (
     <NavigationContainer>
       <Tab.Navigator
@@ -38,7 +36,12 @@ export function AppNavigator({ ws, processingStats }: AppNavigatorProps) {
             tabBarLabel: 'Order Book',
           }}
         >
-          {() => <OrderBookScreen ws={ws} processingStats={processingStats} />}
+          {() => (
+            <OrderBookScreen
+              binanceBaseUrl={binanceBaseUrl}
+              defaultSymbol={defaultSymbol}
+            />
+          )}
         </Tab.Screen>
         <Tab.Screen
           name="Trades"
@@ -47,7 +50,12 @@ export function AppNavigator({ ws, processingStats }: AppNavigatorProps) {
             tabBarLabel: 'Trades',
           }}
         >
-          {() => <TradesScreen ws={ws} processingStats={processingStats} />}
+          {() => (
+            <TradesScreen
+              binanceBaseUrl={binanceBaseUrl}
+              defaultSymbol={defaultSymbol}
+            />
+          )}
         </Tab.Screen>
         <Tab.Screen
           name="MiniTicker"
@@ -56,7 +64,12 @@ export function AppNavigator({ ws, processingStats }: AppNavigatorProps) {
             tabBarLabel: 'Ticker',
           }}
         >
-          {() => <MiniTickerScreen ws={ws} processingStats={processingStats} />}
+          {() => (
+            <MiniTickerScreen
+              binanceBaseUrl={binanceBaseUrl}
+              defaultSymbol={defaultSymbol}
+            />
+          )}
         </Tab.Screen>
         <Tab.Screen
           name="MiniTickerPair"
@@ -66,7 +79,10 @@ export function AppNavigator({ ws, processingStats }: AppNavigatorProps) {
           }}
         >
           {() => (
-            <MiniTickerPairScreen ws={ws} processingStats={processingStats} />
+            <MiniTickerPairScreen
+              binanceBaseUrl={binanceBaseUrl}
+              defaultSymbol={defaultSymbol}
+            />
           )}
         </Tab.Screen>
         <Tab.Screen
@@ -76,7 +92,12 @@ export function AppNavigator({ ws, processingStats }: AppNavigatorProps) {
             tabBarLabel: 'Kline',
           }}
         >
-          {() => <KlineScreen ws={ws} processingStats={processingStats} />}
+          {() => (
+            <KlineScreen
+              binanceBaseUrl={binanceBaseUrl}
+              defaultSymbol={defaultSymbol}
+            />
+          )}
         </Tab.Screen>
       </Tab.Navigator>
     </NavigationContainer>
